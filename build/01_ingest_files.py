@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -18,7 +19,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.config import MIN_CHUNK_WORDS  # noqa: E402
 from build.format_detect import detect_format  # noqa: E402
 from build.parse_filename import parse_filename  # noqa: E402
@@ -71,25 +72,109 @@ def is_filename_flagged(stem: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Parsers
+# OLE2 parsers — platform-aware
 # ---------------------------------------------------------------------------
 
-def parse_ole2(path: Path) -> str:
-    """Extract plain text from OLE2 Word file using antiword."""
+# Persistent Word COM instance (Windows only); avoids starting Word per file.
+_WIN_WORD_APP = None
+
+
+def _get_win_word_app():
+    """Lazy-initialize and return a persistent Word COM instance (Windows only)."""
+    global _WIN_WORD_APP
+    if _WIN_WORD_APP is None:
+        try:
+            import pythoncom
+            import win32com.client
+        except ImportError:
+            raise ParseError(
+                "pywin32 is required on Windows to parse .doc files.\n"
+                "Install with:  pip install pywin32\n"
+                "Also requires Microsoft Word to be installed."
+            )
+        try:
+            pythoncom.CoInitialize()
+            _WIN_WORD_APP = win32com.client.Dispatch("Word.Application")
+            _WIN_WORD_APP.Visible = False
+            _WIN_WORD_APP.DisplayAlerts = 0
+        except Exception as e:
+            raise ParseError(
+                f"Could not start Microsoft Word COM automation: {e}\n"
+                "Ensure Microsoft Word is installed."
+            )
+    return _WIN_WORD_APP
+
+
+def _close_win_word_app() -> None:
+    """Quit the persistent Word COM instance if active."""
+    global _WIN_WORD_APP
+    if _WIN_WORD_APP is not None:
+        try:
+            _WIN_WORD_APP.Quit()
+        except Exception:
+            pass
+        _WIN_WORD_APP = None
+
+
+def _parse_ole2_windows(path: Path) -> str:
+    """Windows: extract text from OLE2 .doc via Word COM automation (pywin32)."""
+    word = _get_win_word_app()
+    abs_path = str(path.resolve())
+    doc = None
+    try:
+        doc = word.Documents.Open(
+            abs_path,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+        )
+        text = doc.Content.Text
+    except Exception as e:
+        raise ParseError(f"Word COM failed on {path.name}: {e}") from e
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(False)
+            except Exception:
+                pass
+    if not text.strip():
+        raise ParseError("Word COM produced empty output")
+    return text
+
+
+def _parse_ole2_antiword(path: Path) -> str:
+    """Linux/macOS: extract text from OLE2 .doc via antiword."""
     result = subprocess.run(
         ['antiword', '-t', str(path)],
         capture_output=True, text=True, timeout=30,
     )
-    if result.returncode not in (0, 1):  # antiword returns 1 on minor issues
-        raise ParseError(f"antiword failed ({result.returncode}): {result.stderr[:200]}")
+    if result.returncode not in (0, 1):  # antiword returns 1 on minor warnings
+        raise ParseError(f"antiword failed (rc={result.returncode}): {result.stderr[:200]}")
     text = result.stdout
     if not text.strip():
         raise ParseError("antiword produced empty output")
     return text
 
 
+def parse_ole2(path: Path) -> str:
+    """Extract plain text from an OLE2 Word file.
+
+    Dispatches to Word COM automation on Windows or antiword on Linux/macOS.
+    """
+    if platform.system() == 'Windows':
+        return _parse_ole2_windows(path)
+    return _parse_ole2_antiword(path)
+
+
+# ---------------------------------------------------------------------------
+# Other parsers
+# ---------------------------------------------------------------------------
+
 def _strip_rtf(raw: str) -> str:
-    """Minimal RTF stripper: no oletools needed."""
+    """Minimal RTF stripper: no oletools needed.
+
+    RTF files use cp1252 encoding (Windows standard for Word 97-2003 RTF),
+    which is why we decode bytes as cp1252 before calling this function.
+    """
     # Remove \* escaped groups (annotations, stylesheet, etc.)
     text = re.sub(r'\\\*[^{}]*', '', raw)
     # Remove { } groups that are purely control (non-text content blocks)
@@ -106,13 +191,14 @@ def _strip_rtf(raw: str) -> str:
     text = re.sub(r'\\[^a-zA-Z]', '', text)
     # Strip remaining braces
     text = text.replace('{', '').replace('}', '')
-    # Normalize whitespace
-    text = re.sub(r'\r\n|\r', '\n', text)
+    # Normalize whitespace and line endings (handles \r\n, \r, \n)
+    text = re.sub(r'\r\n|\r|\n', '\n', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 
 def parse_rtf(path: Path) -> str:
+    # RTF files from Word 97-2003 are always cp1252 encoded
     raw = path.read_bytes().decode('cp1252', errors='replace')
     text = _strip_rtf(raw)
     if not text.strip():
@@ -134,27 +220,6 @@ def parse_docx(path: Path) -> str:
     if not text.strip():
         raise ParseError("python-docx produced empty output")
     return text
-
-
-def parse_pptx(path: Path) -> str:
-    """Extract text from PPTX; returns text and also returns prs object."""
-    try:
-        from pptx import Presentation  # python-pptx
-    except ImportError:
-        raise ParseError("python-pptx not installed")
-    prs = Presentation(str(path))
-    slides_text = []
-    for slide in prs.slides:
-        parts = []
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                for para in shape.text_frame.paragraphs:
-                    line = ' '.join(r.text for r in para.runs).strip()
-                    if line:
-                        parts.append(line)
-        if parts:
-            slides_text.append('\n'.join(parts))
-    return '\n\n'.join(slides_text)
 
 
 def _get_pptx_presentation(path: Path):
@@ -206,7 +271,6 @@ def is_worship_slides(prs) -> bool:
         lines = _slide_lines(slide)
         if not lines:
             continue
-        # Short-line only: all lines are short (<= 8 words), like song lyrics
         if all(len(line.split()) <= 8 for line in lines):
             short_count += 1
     return (short_count / total) > 0.80
@@ -384,8 +448,8 @@ def ingest_file(
     meta = parse_filename(stem)
     doc_id = make_doc_id(stem)
 
-    # Relative source path
-    source_file = str(path)
+    # Store as POSIX path (forward slashes) for cross-platform consistency
+    source_file = path.as_posix()
 
     doc = {
         'doc_id':        doc_id,
@@ -400,7 +464,6 @@ def ingest_file(
 
     if not dry_run:
         Path(out_dir).mkdir(parents=True, exist_ok=True)
-        # Skip if already exists and --force not set
         out_path = Path(out_dir) / f"{doc_id}.json"
         if out_path.exists() and not force:
             if verbose:
@@ -442,6 +505,10 @@ def main() -> None:
         files = files[:args.limit]
 
     print(f"Found {len(files)} files in {args.source!r}")
+    if platform.system() == 'Windows':
+        print("Platform: Windows — .doc files will use Word COM automation (pywin32)")
+    else:
+        print(f"Platform: {platform.system()} — .doc files will use antiword")
     if args.dry_run:
         print("DRY RUN — no files will be written")
 
@@ -454,17 +521,21 @@ def main() -> None:
     except ImportError:
         iterator = files  # type: ignore[assignment]
 
-    for path in iterator:
-        outcome = ingest_file(
-            path=path,
-            out_dir=args.out,
-            quarantine_root=args.quarantine,
-            seen_hashes=seen_hashes,
-            dry_run=args.dry_run,
-            force=args.force,
-            verbose=args.verbose,
-        )
-        counts[outcome] = counts.get(outcome, 0) + 1
+    try:
+        for path in iterator:
+            outcome = ingest_file(
+                path=path,
+                out_dir=args.out,
+                quarantine_root=args.quarantine,
+                seen_hashes=seen_hashes,
+                dry_run=args.dry_run,
+                force=args.force,
+                verbose=args.verbose,
+            )
+            counts[outcome] = counts.get(outcome, 0) + 1
+    finally:
+        # Always close the Word COM instance if it was opened on Windows
+        _close_win_word_app()
 
     print("\n--- Ingest Summary ---")
     total = sum(counts.values())

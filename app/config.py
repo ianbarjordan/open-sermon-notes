@@ -13,7 +13,7 @@ EMBEDDING_DIM       = 384
 # ---------------------------------------------------------------------------
 MODEL_PATH          = "models/Phi-3.5-mini-instruct-Q4_K_M.gguf"
 CTX_WINDOW          = 4096
-N_THREADS           = os.cpu_count() // 2
+N_THREADS           = max(1, (os.cpu_count() or 2) // 2)
 N_GPU_LAYERS        = 0        # Set >0 if CUDA is available at runtime
 USE_MMAP            = True
 

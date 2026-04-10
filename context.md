@@ -133,19 +133,44 @@ app/app.py                 ← Gradio UI: query → hybrid retrieval → Phi-3.5
 
 ## Environment Setup
 
-```bash
-cd /workspace/sermon-notes-offline
+### Windows (native)
+
+```powershell
+# Prerequisites:
+#   Python 3.11  — https://python.org/downloads
+#   uv           — https://docs.astral.sh/uv/getting-started/installation/
+#   Microsoft Word (required for .doc parsing via COM automation)
+
+cd open-sermon-notes
 
 # Create venv
 uv venv .venv --python 3.11
 
-# Install torch first (CUDA wheel)
-uv pip install torch
+# Activate
+.venv\Scripts\activate
 
-# Install build dependencies
+# Install torch (CPU build — sufficient for inference)
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Install build + app dependencies (pywin32 installed automatically on Windows)
+pip install -r build/requirements_build.txt
+pip install -r app/requirements_app.txt
+
+# Run post-install step for pywin32 (registers COM components)
+python .venv\Scripts\pywin32_postinstall.py -install
+```
+
+### Linux / WSL
+
+```bash
+cd sermon-notes-offline
+
+# Prerequisites: antiword
+sudo apt-get install -y antiword
+
+uv venv .venv --python 3.11
+uv pip install torch                          # CUDA build auto-selected
 uv pip install -r build/requirements_build.txt
-
-# Later, install app dependencies
 uv pip install -r app/requirements_app.txt
 ```
 
@@ -157,7 +182,7 @@ uv pip install -r app/requirements_app.txt
 |-----------|--------|-------|
 | `.docx` | `python-docx` | Standard XML zip |
 | `.pptx` | `python-pptx` | Standard XML zip |
-| `.doc` | `antiword -t` (OLE2) or regex RTF stripper | Detected by magic bytes |
+| `.doc` | Word COM/pywin32 (Windows) or `antiword` (Linux) for OLE2; regex stripper for RTF | Detected by magic bytes |
 | `.DOC` | Same as `.doc` | Uppercase variant |
 | `.pub` | Quarantine | Microsoft Publisher — no free parser |
 
