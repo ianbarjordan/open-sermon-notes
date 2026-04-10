@@ -1,0 +1,9 @@
+# Install torch (GPU/CUDA build) FIRST before this file:
+#   uv pip install torch
+
+sentence-transformers>=3.0,<4   # BAAI/bge-small-en-v1.5
+faiss-cpu>=1.8,<2
+numpy>=1.26,<2
+python-docx>=1.1,<2             # .docx parsing
+python-pptx>=0.6,<1             # .pptx parsing
+tqdm>=4.66,<5

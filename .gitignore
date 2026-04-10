@@ -1,0 +1,8 @@
+data/
+models/*.gguf
+raw/
+SampleData/
+*.faiss
+*.db
+__pycache__/
+.venv/
