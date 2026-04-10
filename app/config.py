@@ -24,6 +24,8 @@ TOP_K               = 5        # Final number of chunks returned to the LLM
 RRF_K               = 60       # Reciprocal Rank Fusion constant
 NPROBE              = 64       # FAISS IVF probe count (higher = slower but more accurate)
 CONFIDENCE_THRESHOLD = 0.005   # Minimum RRF score to include a result (RRF max ~0.033 with K=60)
+LOW_CONFIDENCE_THRESHOLD = 0.018  # Below this, warn user results may not be relevant
+                                   # 0.018 ≈ requires presence in both dense+sparse lists
 
 # ---------------------------------------------------------------------------
 # Chunking

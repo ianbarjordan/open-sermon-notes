@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from app.config import DB_PATH, FAISS_PATH, ID_MAP_PATH, MODEL_PATH  # noqa: E402
+from app.config import DB_PATH, FAISS_PATH, ID_MAP_PATH, LOW_CONFIDENCE_THRESHOLD, MODEL_PATH  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Global retriever + LLM (loaded once at startup)
@@ -94,20 +94,34 @@ def handle_query(query: str):
             f"{top.get('text', '')[:500]}..."
         )
 
+    # Theoretical max RRF score: two lists each contribute 1/(RRF_K+1)
+    RRF_MAX = 2.0 / 61.0
+    max_score = max(c.get('score', 0) for c in chunks)
+
     # Build dataframe rows
     rows = []
     for i, c in enumerate(chunks):
         snippet = (c.get('text') or '')[:120] + '...'
+        match_pct = f"{min(c.get('score', 0) / RRF_MAX * 100, 100):.0f}%"
         rows.append([
             i + 1,
             c.get('title') or '',
             c.get('scripture_ref') or '',
             c.get('date') or '',
             snippet,
+            match_pct,
             c.get('source_file') or '',
         ])
 
-    status = f"{len(chunks)} result(s) returned"
+    if max_score < LOW_CONFIDENCE_THRESHOLD:
+        status = (
+            f"⚠️ Low confidence ({max_score:.3f}) — "
+            "this topic may not be in your archive. "
+            "Results shown are the closest matches available."
+        )
+    else:
+        status = f"{len(chunks)} result(s) returned"
+
     return answer, rows, status, chunks
 
 
@@ -175,8 +189,8 @@ def build_ui():
         answer_md = gr.Markdown(label="Answer", value="")
 
         results_df = gr.Dataframe(
-            headers=["#", "Title", "Scripture", "Date", "Snippet", "Source File"],
-            datatype=["number", "str", "str", "str", "str", "str"],
+            headers=["#", "Title", "Scripture", "Date", "Snippet", "Match %", "Source File"],
+            datatype=["number", "str", "str", "str", "str", "str", "str"],
             label="Source Chunks",
             wrap=True,
         )
