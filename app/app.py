@@ -1,15 +1,16 @@
 """
-app.py — Gradio 5 Blocks UI for offline sermon RAG search.
+app.py — Gradio UI for AI-Powered Sermon Note Search.
 
 Usage:
     python app/app.py --port 7860
     python app/app.py --host 0.0.0.0 --port 7860 --share
 """
 import argparse
+import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.config import DB_PATH, FAISS_PATH, ID_MAP_PATH, MODEL_PATH  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -58,31 +59,25 @@ def _load_components(
 # ---------------------------------------------------------------------------
 
 def handle_query(query: str):
-    """Main event handler called by Gradio on submit.
+    """Search handler — returns (answer, dataframe_rows, status, chunks_state).
 
-    Returns (answer_str, dataframe_rows, status_str).
+    chunks_state is stored in a gr.State so the Open File handler can access it.
     """
+    empty = ("Please enter a question.", [], "No query.", [])
+
     if not query or not query.strip():
-        return "Please enter a question.", [], "No query."
+        return empty
 
     if _retriever is None:
-        return (
-            "Retriever is not available. Check startup logs.",
-            [],
-            "Error: retriever not loaded",
-        )
+        return ("Retriever is not available. Check startup logs.", [], "Error: retriever not loaded", [])
 
     try:
         chunks = _retriever.search(query)
     except Exception as e:
-        return f"Retrieval error: {e}", [], f"Error: {e}"
+        return (f"Retrieval error: {e}", [], f"Error: {e}", [])
 
     if not chunks:
-        return (
-            "No relevant sermons found for this query.",
-            [],
-            "0 results",
-        )
+        return ("No relevant sermons found for this query.", [], "0 results", [])
 
     # Build answer via LLM (or fallback if LLM not loaded)
     if _llm is not None:
@@ -91,7 +86,6 @@ def handle_query(query: str):
         except Exception as e:
             answer = f"(LLM error: {e})\n\nTop result: {chunks[0].get('text', '')[:300]}"
     else:
-        # Graceful degradation: show top chunk snippet without LLM
         top = chunks[0]
         answer = (
             f"**Note:** LLM not loaded — showing top match only.\n\n"
@@ -114,7 +108,45 @@ def handle_query(query: str):
         ])
 
     status = f"{len(chunks)} result(s) returned"
-    return answer, rows, status
+    return answer, rows, status, chunks
+
+
+# ---------------------------------------------------------------------------
+# Open file handler
+# ---------------------------------------------------------------------------
+
+def open_file(result_num: int, chunks_state: list) -> str:
+    """Open the Nth result file in the OS default application (Word / PowerPoint).
+
+    Uses os.startfile() on Windows, subprocess on Linux/macOS.
+    """
+    if not chunks_state:
+        return "No search results to open. Run a search first."
+
+    idx = int(result_num) - 1
+    if idx < 0 or idx >= len(chunks_state):
+        return f"Result #{int(result_num)} does not exist (only {len(chunks_state)} results)."
+
+    source = chunks_state[idx].get('source_file', '')
+    if not source:
+        return "No file path recorded for this result."
+
+    path = Path(source).resolve()
+    if not path.exists():
+        return f"File not found on disk: {path}"
+
+    try:
+        if sys.platform == 'win32':
+            os.startfile(str(path))
+        elif sys.platform == 'darwin':
+            import subprocess
+            subprocess.run(['open', str(path)], check=True)
+        else:
+            import subprocess
+            subprocess.run(['xdg-open', str(path)], check=True)
+        return f"Opened: {path.name}"
+    except Exception as e:
+        return f"Could not open file: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -124,12 +156,12 @@ def handle_query(query: str):
 def build_ui():
     import gradio as gr
 
-    with gr.Blocks(title="Sermon Notes — Offline RAG Search") as demo:
-        gr.Markdown("# Sermon Notes — Offline RAG Search")
-        gr.Markdown(
-            "Search your 27-year sermon archive. "
-            "Ask a question and get an AI-assisted answer with sources."
-        )
+    with gr.Blocks(title="AI-Powered Sermon Note Search") as demo:
+        gr.Markdown("# AI-Powered Sermon Note Search")
+        gr.Markdown("Search your sermon archive.")
+
+        # Hidden state — holds the last set of retrieved chunks for the Open handler
+        chunks_state = gr.State([])
 
         with gr.Row():
             query_box = gr.Textbox(
@@ -149,14 +181,33 @@ def build_ui():
             wrap=True,
         )
 
+        # Open file row
+        with gr.Row():
+            result_num = gr.Number(
+                value=1,
+                minimum=1,
+                maximum=5,
+                step=1,
+                label="Result #",
+                scale=1,
+            )
+            open_btn = gr.Button("Open File", scale=2)
+            open_status = gr.Textbox(
+                label="",
+                interactive=False,
+                scale=4,
+                show_label=False,
+            )
+
         status_md = gr.Markdown(value="")
 
-        # Wire up events
-        submit_inputs = [query_box]
-        submit_outputs = [answer_md, results_df, status_md]
+        # Search events
+        search_outputs = [answer_md, results_df, status_md, chunks_state]
+        search_btn.click(fn=handle_query, inputs=[query_box], outputs=search_outputs)
+        query_box.submit(fn=handle_query, inputs=[query_box], outputs=search_outputs)
 
-        search_btn.click(fn=handle_query, inputs=submit_inputs, outputs=submit_outputs)
-        query_box.submit(fn=handle_query, inputs=submit_inputs, outputs=submit_outputs)
+        # Open file event
+        open_btn.click(fn=open_file, inputs=[result_num, chunks_state], outputs=[open_status])
 
     return demo
 
@@ -166,7 +217,7 @@ def build_ui():
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description='Gradio UI for offline sermon RAG search.')
+    p = argparse.ArgumentParser(description='Gradio UI for AI-Powered Sermon Note Search.')
     p.add_argument('--host',  metavar='STR', default='127.0.0.1')
     p.add_argument('--port',  metavar='INT', type=int, default=7860)
     p.add_argument('--share', action='store_true', help='Create a public Gradio share link')
