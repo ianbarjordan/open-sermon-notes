@@ -1,81 +1,104 @@
 # sermon-notes-offline — Project Context
 
 Fully offline RAG desktop application for a pastor to query 27+ years of sermon notes.
-Modelled on the wiki-offline architecture with key adaptations for sermon document types.
+Runs on Windows (native) and Linux/WSL. No cloud services required.
 
 ---
 
 ## Architecture Overview
 
 ```
-raw/source_files/          ← original sermon files (gitignored)
+SampleData/  (or any source dir)
        │
        ▼
-build/01_ingest_files.py   ← parse + quarantine filter
-       │
+build/01_ingest_files.py   ← detect format, parse text, apply 10-step quarantine filter
+       │  writes → data/documents/<doc_id>.json   (one per accepted file)
        ▼
-build/02_chunk_embed.py    ← chunk text → embed with BGE-small → store in FAISS + FTS5
-       │
+build/02_chunk_embed.py    ← sentence-aware chunking → BGE-small embeddings → FAISS + FTS5
+       │  writes → data/sermons.faiss   (IndexFlatL2, 384-dim)
+       │           data/sermons.db      (SQLite FTS5 chunks + document metadata)
+       │           data/id_map.json     (FAISS int position → chunk_id string)
        ▼
-data/sermons.db            ← SQLite: FTS5 full-text index + chunk metadata
-data/sermons.faiss         ← FAISS IVF index of 384-dim embeddings
-data/id_map.json           ← maps FAISS integer IDs → chunk metadata keys
-       │
-       ▼
-app/app.py                 ← Gradio UI: query → hybrid retrieval → Phi-3.5-mini LLM → answer
+app/app.py   ← Gradio UI: query → hybrid retrieval (FAISS + FTS5 + RRF) → Phi-3.5-mini → answer
 ```
 
 ---
 
 ## Module Architecture
 
-### Build Phase (`build/`)
+### Build helpers (`build/`)
+
+| Module | Responsibility |
+|--------|---------------|
+| `format_detect.py` | Read magic bytes → `'ole2'`, `'rtf'`, `'ooxml'`, or `'unknown'` |
+| `normalize_scripture.py` | Map any book alias to canonical name (e.g. `"1Cor"` → `"1 Corinthians"`) |
+| `parse_filename.py` | Extract scripture ref / date / series number / title from filename stem |
+| `chunk_text.py` | Sentence-aware sliding window chunker; protect/restore abbreviations for regex compat |
+
+### Build pipeline (`build/`)
 
 | Script | Responsibility |
 |--------|---------------|
-| `01_ingest_files.py` | Walk `raw/source_files/`, detect format, parse to plain text, route failures to `raw/quarantine/` |
-| `02_chunk_embed.py` | Split parsed text into chunks, embed with BGE-small-en-v1.5, write FAISS index + SQLite FTS5 |
+| `01_ingest_files.py` | Walk source dir; dispatch OLE2/RTF/DOCX/PPTX parsers; 10-step quarantine; write JSON |
+| `02_chunk_embed.py` | Load JSON docs; chunk; embed with BGE-small-en-v1.5; write FAISS + FTS5 + id_map |
 
-**Helper modules (build/):**
-- `normalize_scripture.py` — normalise Bible book names to canonical form (e.g. "Gen" → "Genesis")
-- `parse_filename.py` — extract date, series, title metadata from filename
-- `chunk_text.py` — sentence-aware chunking respecting `MIN_CHUNK_WORDS` / `COMMENTARY_CHUNK_WORDS`
-- `format_detect.py` — distinguish OLE2 `.doc`, RTF masquerading as `.doc`, true `.docx`
+### App (`app/`)
 
-### App Phase (`app/`)
-
-| Script | Responsibility |
+| Module | Responsibility |
 |--------|---------------|
-| `app.py` | Gradio web UI, query entry point |
-| `retriever.py` | Hybrid retrieval: FAISS ANN + FTS5 BM25, fused via RRF |
-| `llm.py` | llama-cpp-python wrapper for Phi-3.5-mini-instruct |
-| `config.py` | All constants and paths (single source of truth) |
+| `config.py` | All constants and paths — single source of truth |
+| `retriever.py` | `load_retriever()` factory; `Retriever.search()` hybrid dense+sparse+RRF |
+| `llm.py` | `load_llm()` factory; `LLM.generate()` wraps llama-cpp Phi-3.5-mini-instruct |
+| `app.py` | Gradio Blocks UI; loads retriever + LLM once at startup; graceful LLM degradation |
 
 ---
 
 ## Data Flow
 
-1. **Ingest:** `.docx`/`.pptx`/`.doc` files → plain text paragraphs
-2. **Quarantine:** files failing quality checks → `raw/quarantine/<reason>/`
-3. **Chunk:** text split into overlapping windows (~150 words for commentary)
-4. **Embed:** BGE-small-en-v1.5 produces 384-dim vectors, stored in FAISS IVF
-5. **Index:** SQLite FTS5 indexes raw chunk text for keyword search
-6. **Query:** user question → embed (with query prefix) + BM25 search → RRF fusion → top-5 chunks → Phi-3.5-mini → answer
+1. **Ingest** — `01_ingest_files.py` reads each source file, detects format via magic bytes,
+   parses to plain text, runs 10-step quarantine checks, writes accepted files as JSON to
+   `data/documents/`.
+2. **Chunk + Embed** — `02_chunk_embed.py` loads the JSONs, splits text into overlapping
+   ~150-word windows, encodes each chunk with BGE-small-en-v1.5 (384-dim, normalized),
+   adds vectors to a `faiss.IndexFlatL2`, inserts chunk text into SQLite FTS5, saves all
+   three artifacts.
+3. **Query** — `app.py` loads the three artifacts once at startup. On each query:
+   - FAISS ANN search with `EMBED_QUERY_PREFIX` prepended to the query
+   - FTS5 BM25 keyword search with sanitized token OR expression
+   - Reciprocal Rank Fusion (RRF, K=60) merges both ranked lists
+   - Top-5 chunks above `CONFIDENCE_THRESHOLD` passed to Phi-3.5-mini
+   - LLM answers strictly from provided excerpts; cites title + scripture ref
 
 ---
 
-## Quarantine Categories
+## Quarantine Pipeline (10 steps in order)
 
-| Directory | Reason |
-|-----------|--------|
-| `format_pub/` | Microsoft Publisher files (`.pub`) — unreadable |
-| `too_short/` | Parsed text below `MIN_CHUNK_WORDS` threshold |
-| `filename_flagged/` | Filename suggests non-sermon content |
-| `non_faith/` | Content classifier detects non-faith material |
-| `sparse_pptx/` | PowerPoint with fewer than 3 text-bearing slides |
-| `worship_slides/` | Lyrics-only slides with no sermon content |
-| `duplicates/` | Near-duplicate of an already-indexed file |
-| `manual_review/` | Ambiguous — needs human decision |
+| Step | Condition | Destination |
+|------|-----------|-------------|
+| 1 | `.Identifier`, `.csv`, `.md` | Silent skip |
+| 2 | Extension `.pub` | `format_pub/` |
+| 3 | Admin keyword in filename | `filename_flagged/` |
+| 4 | Parse fails | `manual_review/` |
+| 5 | `word_count < MIN_CHUNK_WORDS` | `too_short/` |
+| 6 | PPTX: >80% short-line-only slides | `worship_slides/` |
+| 7 | PPTX: <3 text-bearing slides | `sparse_pptx/` |
+| 8 | Faith keyword hits < 2 | `non_faith/` |
+| 9 | SHA-256 already seen | `duplicates/` |
+| 10 | — | **Accepted → write JSON** |
+
+---
+
+## Document Parsing by Format
+
+| Extension | Format detection | Parser |
+|-----------|-----------------|--------|
+| `.docx` | `PK\x03\x04` magic (OOXML) | `python-docx` |
+| `.pptx` | `PK\x03\x04` magic (OOXML) | `python-pptx` |
+| `.doc` / `.DOC` | `\xd0\xcf\x11\xe0` (OLE2) | **Windows:** Word COM via `pywin32`; **Linux:** `antiword -t` |
+| `.doc` (some) | `{\` magic (RTF) | Regex stripper — strips control words, decodes `\'XX` cp1252 escapes |
+| `.pub` | OLE2 subtype | Quarantined — no free parser |
+
+A single Word COM instance is opened once per ingest run on Windows (not per file) for performance.
 
 ---
 
@@ -83,51 +106,58 @@ app/app.py                 ← Gradio UI: query → hybrid retrieval → Phi-3.5
 
 | Constant | Value | Notes |
 |----------|-------|-------|
-| `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | 384-dim, ~33 MB |
+| `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | 384-dim, ~33 MB download |
 | `EMBED_QUERY_PREFIX` | `"Represent this sentence..."` | Required for BGE asymmetric retrieval |
 | `EMBEDDING_DIM` | `384` | Must match FAISS index dim |
-| `MODEL_PATH` | `models/Phi-3.5-mini-instruct-Q4_K_M.gguf` | ~2.4 GB |
-| `CTX_WINDOW` | `4096` | Phi-3.5-mini context |
-| `TOP_K` | `5` | Chunks passed to LLM |
-| `RRF_K` | `60` | RRF fusion constant |
-| `NPROBE` | `64` | FAISS search probes |
+| `MODEL_PATH` | `models/Phi-3.5-mini-instruct-Q4_K_M.gguf` | ~2.4 GB, download separately |
+| `CTX_WINDOW` | `4096` | Phi-3.5-mini context length |
+| `N_GPU_LAYERS` | `0` | Set >0 to offload layers to GPU |
+| `N_THREADS` | `max(1, cpu_count//2)` | Guards against `None` on some VMs |
+| `TOP_K` | `5` | Chunks returned to LLM |
+| `RRF_K` | `60` | Reciprocal Rank Fusion constant |
 | `CONFIDENCE_THRESHOLD` | `0.005` | Min RRF score (max ~0.033 with K=60) |
-| `MIN_CHUNK_WORDS` | `50` | Discard very short chunks |
+| `MIN_CHUNK_WORDS` | `50` | Discard chunks shorter than this |
 | `COMMENTARY_CHUNK_WORDS` | `150` | Target chunk size |
+| `DB_PATH` | `data/sermons.db` | SQLite FTS5 |
+| `FAISS_PATH` | `data/sermons.faiss` | FAISS IndexFlatL2 |
+| `ID_MAP_PATH` | `data/id_map.json` | `{int_pos: chunk_id}` |
+| `DOCUMENTS_DIR` | `data/documents` | Intermediate JSON store |
 
 ---
 
 ## Dependencies
 
-### Build Phase
-- `sentence-transformers>=3.0` — BGE embedding
+### Build phase (`build/requirements_build.txt`)
+- `sentence-transformers>=3.0` — BGE-small embedding
 - `faiss-cpu>=1.8` — vector index
 - `python-docx>=1.1` — `.docx` parsing
 - `python-pptx>=0.6` — `.pptx` parsing
 - `numpy>=1.26`
 - `tqdm>=4.66`
+- `pywin32>=306` *(Windows only, auto-selected via `sys_platform` marker)*
 
-### App Phase
-- `gradio>=5.0` — web UI
-- `llama-cpp-python==0.3.16` — LLM inference
+### App phase (`app/requirements_app.txt`)
+- `gradio>=5.0` — Blocks web UI (tested with 6.11)
+- `llama-cpp-python==0.3.16` — Phi-3.5-mini inference
 - `faiss-cpu>=1.8`
 - `sentence-transformers>=3.0`
 - `numpy>=1.26`
 
 ### System
 - Python 3.11
-- SQLite 3.35+ (FTS5 required — standard in Python 3.11)
-- uv (virtual environment and package management)
+- SQLite 3.35+ with FTS5 (standard in Python 3.11)
+- **Windows:** Microsoft Word (for `.doc` COM parsing)
+- **Linux/WSL:** `antiword` (`sudo apt-get install antiword`)
 
 ---
 
-## Entry Points
+## Package / Import Notes
 
-| Command | Purpose |
-|---------|---------|
-| `build/01_ingest_files.py --source raw/source_files/` | Parse and quarantine-filter all source files |
-| `build/02_chunk_embed.py` | Build FAISS index and SQLite FTS5 database |
-| `app/app.py` | Launch Gradio UI (http://localhost:7860) |
+- `app/__init__.py` and `build/__init__.py` are required empty files. Without them,
+  Python treats `app/` as a namespace package and `app/app.py` shadows the `app` package
+  name on the `sys.path`, causing `ModuleNotFoundError: 'app' is not a package`.
+- All scripts add the project root to `sys.path` via
+  `sys.path.insert(0, str(Path(__file__).resolve().parent.parent))`.
 
 ---
 
@@ -137,26 +167,23 @@ app/app.py                 ← Gradio UI: query → hybrid retrieval → Phi-3.5
 
 ```powershell
 # Prerequisites:
-#   Python 3.11  — https://python.org/downloads
-#   uv           — https://docs.astral.sh/uv/getting-started/installation/
-#   Microsoft Word (required for .doc parsing via COM automation)
+#   Python 3.11   https://python.org/downloads
+#   uv            https://docs.astral.sh/uv/getting-started/installation/
+#   Microsoft Word (for .doc parsing)
 
 cd open-sermon-notes
 
-# Create venv
 uv venv .venv --python 3.11
-
-# Activate
 .venv\Scripts\activate
 
-# Install torch (CPU build — sufficient for inference)
+# Torch CPU build (sufficient for embeddings + inference)
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-# Install build + app dependencies (pywin32 installed automatically on Windows)
+# All other dependencies (pywin32 installed automatically on Windows)
 pip install -r build/requirements_build.txt
 pip install -r app/requirements_app.txt
 
-# Run post-install step for pywin32 (registers COM components)
+# Register pywin32 COM components (required once after install)
 python .venv\Scripts\pywin32_postinstall.py -install
 ```
 
@@ -164,74 +191,56 @@ python .venv\Scripts\pywin32_postinstall.py -install
 
 ```bash
 cd sermon-notes-offline
-
-# Prerequisites: antiword
 sudo apt-get install -y antiword
 
 uv venv .venv --python 3.11
-uv pip install torch                          # CUDA build auto-selected
+uv pip install torch                           # CUDA wheel auto-selected
 uv pip install -r build/requirements_build.txt
 uv pip install -r app/requirements_app.txt
 ```
 
 ---
 
-## Document Source Formats
+## Running the Pipeline
 
-| Extension | Parser | Notes |
-|-----------|--------|-------|
-| `.docx` | `python-docx` | Standard XML zip |
-| `.pptx` | `python-pptx` | Standard XML zip |
-| `.doc` | Word COM/pywin32 (Windows) or `antiword` (Linux) for OLE2; regex stripper for RTF | Detected by magic bytes |
-| `.DOC` | Same as `.doc` | Uppercase variant |
-| `.pub` | Quarantine | Microsoft Publisher — no free parser |
+### Windows
+```powershell
+# 1. Ingest source files
+python build\01_ingest_files.py --source SampleData --verbose
+
+# 2. Chunk + embed
+python build\02_chunk_embed.py
+
+# 3. Download LLM model (~2.4 GB, one-time)
+python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='bartowski/Phi-3.5-mini-instruct-GGUF', filename='Phi-3.5-mini-instruct-Q4_K_M.gguf', local_dir='models')"
+
+# 4. Launch app
+python app\app.py --port 7860
+```
+
+### Linux / WSL
+```bash
+.venv/bin/python build/01_ingest_files.py --source SampleData/ --verbose
+.venv/bin/python build/02_chunk_embed.py
+.venv/bin/python app/app.py --port 7860
+```
+
+Open `http://127.0.0.1:7860` in your browser.
 
 ---
 
-## Implementation Status
+## Verified Results (SampleData, 253 files)
 
-All 9 scripts implemented and tested:
-
-### Build Helpers
-- `build/format_detect.py` — magic-byte format detection (OLE2/RTF/OOXML)
-- `build/normalize_scripture.py` — 66-book alias → canonical name mapping
-- `build/parse_filename.py` — scripture-first / date-YYMMDD / date-MDDYY / numbered / plain
-- `build/chunk_text.py` — sentence-aware sliding window chunker (protect/restore abbreviations)
-
-### Build Pipeline
-- `build/01_ingest_files.py` — 10-step quarantine pipeline; antiword for OLE2; 153/253 accepted
-- `build/02_chunk_embed.py` — 7240 chunks; BGE-small-en-v1.5 embeddings; FAISS IndexFlatL2
-
-### App
-- `app/retriever.py` — FAISS dense + FTS5 sparse + RRF fusion hybrid retrieval
-- `app/llm.py` — llama-cpp Phi-3.5-mini wrapper with pastoral system prompt
-- `app/app.py` — Gradio 5 Blocks UI (graceful degradation if LLM missing)
-
-### Notes
-- `app/__init__.py` and `build/__init__.py` required (prevent `app/app.py` shadowing `app` namespace)
-- `.doc` OLE2 parsed via `antiword -t`; RTF via regex stripper; `.docx` via python-docx; `.pptx` via python-pptx
-- All parse errors caught as `ParseError` → `manual_review` quarantine bucket
-
-## Running the Pipeline
-
-```bash
-# 1. Ingest (already done for SampleData/)
-.venv/bin/python build/01_ingest_files.py --source SampleData/ --verbose
-
-# 2. Chunk + embed (already done)
-.venv/bin/python build/02_chunk_embed.py
-
-# 3. Test retrieval
-.venv/bin/python app/retriever.py --query "What did I preach about grace?"
-
-# 4. Download LLM (optional, ~2.4 GB)
-.venv/bin/python -c "
-from huggingface_hub import hf_hub_download
-hf_hub_download(repo_id='bartowski/Phi-3.5-mini-instruct-GGUF',
-                filename='Phi-3.5-mini-instruct-Q4_K_M.gguf',
-                local_dir='models/')
-"
-
-# 5. Launch app
-.venv/bin/python app/app.py --port 7860
-```
+| Outcome | Count |
+|---------|-------|
+| accepted | 153 |
+| skipped (.Identifier / .csv / .md) | 21 |
+| too_short | 19 |
+| non_faith | 18 |
+| filename_flagged | 15 |
+| format_pub | 13 |
+| manual_review | 10 |
+| worship_slides | 3 |
+| duplicates | 1 |
+| **FAISS vectors** | **7,240** |
+| **FTS5 chunks** | **7,240** |
