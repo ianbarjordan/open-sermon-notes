@@ -1,8 +1,8 @@
 # Install torch (GPU/CUDA build) FIRST before this file:
 #   uv pip install torch
 
-gradio>=5.0,<6
+gradio>=5.0
 llama-cpp-python==0.3.16
-faiss-cpu>=1.8,<2
+faiss-cpu>=1.8
 sentence-transformers>=3.0,<4
-numpy>=1.26,<2
+numpy>=1.26
