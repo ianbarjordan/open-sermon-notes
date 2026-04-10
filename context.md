@@ -183,8 +183,10 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r build/requirements_build.txt
 pip install -r app/requirements_app.txt
 
-# Register pywin32 COM components (required once after install)
-python .venv\Scripts\pywin32_postinstall.py -install
+# Verify pywin32 is working (pywin32>=306 installed via uv/pip does not need a post-install step)
+python -c "import win32com.client; print('pywin32 OK')"
+# If that fails, run the post-install script manually:
+# python .venv\Lib\site-packages\pywin32_postinstall.py -install
 ```
 
 ### Linux / WSL
