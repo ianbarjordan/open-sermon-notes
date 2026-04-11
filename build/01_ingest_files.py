@@ -375,13 +375,27 @@ def quarantine(path: Path, reason: str, root: str, dry_run: bool = False) -> Non
             print(f"  WARNING: could not quarantine {path.name}: {e}", file=sys.stderr)
 
 
+def _strip_surrogates(value: str) -> str:
+    """Remove lone surrogate characters that Word COM occasionally produces.
+
+    Lone surrogates (U+D800–U+DFFF) are valid in Python strings but cannot be
+    encoded as UTF-8, so they must be removed before writing JSON.
+    """
+    return value.encode('utf-8', errors='replace').decode('utf-8')
+
+
 def write_document_json(doc: dict, out_dir: str) -> None:
     """Atomically write document JSON via a temp file."""
-    out_path = Path(out_dir) / f"{doc['doc_id']}.json"
+    # Sanitize all string fields to strip lone surrogates
+    clean = {
+        k: (_strip_surrogates(v) if isinstance(v, str) else v)
+        for k, v in doc.items()
+    }
+    out_path = Path(out_dir) / f"{clean['doc_id']}.json"
     tmp_fd, tmp_path = tempfile.mkstemp(dir=out_dir, suffix='.tmp')
     try:
         with os.fdopen(tmp_fd, 'w', encoding='utf-8') as fh:
-            json.dump(doc, fh, indent=2, ensure_ascii=False)
+            json.dump(clean, fh, indent=2, ensure_ascii=False)
         os.replace(tmp_path, out_path)
     except Exception:
         try:

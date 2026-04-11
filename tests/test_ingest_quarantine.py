@@ -18,6 +18,8 @@ is_filename_flagged  = _mod.is_filename_flagged
 count_faith_hits     = _mod.count_faith_hits
 compute_sha256       = _mod.compute_sha256
 make_doc_id          = _mod.make_doc_id
+_strip_surrogates    = _mod._strip_surrogates
+write_document_json  = _mod.write_document_json
 
 
 # ---------------------------------------------------------------------------
@@ -140,3 +142,85 @@ def test_compute_sha256_different_files():
         f2.write(b"content two")
         p2 = Path(f2.name)
     assert compute_sha256(p1) != compute_sha256(p2)
+
+
+# ---------------------------------------------------------------------------
+# _strip_surrogates
+# ---------------------------------------------------------------------------
+
+def test_strip_surrogates_clean_text():
+    text = "Grace and mercy from Jesus Christ."
+    assert _strip_surrogates(text) == text
+
+
+def test_strip_surrogates_removes_lone_surrogate():
+    # Insert a lone surrogate (U+DB00) — valid Python str, invalid UTF-8
+    text = "Hello \udB00 world"
+    result = _strip_surrogates(text)
+    assert '\udB00' not in result
+    assert 'Hello' in result
+    assert 'world' in result
+
+
+def test_strip_surrogates_result_is_utf8_encodable():
+    text = "Sermon \udb00\udc00 text with surrogates"
+    result = _strip_surrogates(text)
+    # Should not raise
+    result.encode('utf-8')
+
+
+def test_strip_surrogates_empty_string():
+    assert _strip_surrogates('') == ''
+
+
+# ---------------------------------------------------------------------------
+# write_document_json — surrogate handling
+# ---------------------------------------------------------------------------
+
+def test_write_document_json_with_surrogates():
+    """write_document_json must not crash when text contains lone surrogates."""
+    import json, tempfile
+    doc = {
+        'doc_id':        'test_surrogate',
+        'source_file':   'test.docx',
+        'title':         'Test',
+        'scripture_ref': None,
+        'date':          None,
+        'format':        'ooxml_doc',
+        'word_count':    10,
+        'text':          'Valid text \udb00 with surrogate.',
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        write_document_json(doc, tmpdir)
+        out = Path(tmpdir) / 'test_surrogate.json'
+        assert out.exists()
+        loaded = json.loads(out.read_text(encoding='utf-8'))
+        assert loaded['doc_id'] == 'test_surrogate'
+        assert '\udb00' not in loaded['text']
+
+
+# ---------------------------------------------------------------------------
+# quarantine — PermissionError tolerance
+# ---------------------------------------------------------------------------
+
+def test_quarantine_skips_existing_file():
+    """quarantine() must not crash when destination already exists."""
+    import tempfile
+    from build.format_detect import detect_format  # noqa
+
+    # Re-import quarantine from the loaded module
+    quarantine_fn = _mod.quarantine
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create a source file
+        src = Path(tmpdir) / "sermon.doc"
+        src.write_bytes(b"fake content")
+        qroot = str(Path(tmpdir) / "quarantine")
+
+        # First call — should succeed
+        quarantine_fn(src, 'manual_review', qroot)
+        dest = Path(qroot) / 'manual_review' / 'sermon.doc'
+        assert dest.exists()
+
+        # Second call — file already exists, must not raise
+        quarantine_fn(src, 'manual_review', qroot)
