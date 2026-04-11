@@ -158,11 +158,20 @@ def _parse_ole2_windows(path: Path) -> str:
     try:
         doc = word.Documents.Open(
             abs_path,
+            ConfirmConversions=False,
             ReadOnly=True,
             AddToRecentFiles=False,
         )
         text = doc.Content.Text
     except Exception as e:
+        msg = str(e)
+        if 'detected a problem' in msg or '-2146821993' in msg:
+            raise ParseError(
+                f"Word blocked {path.name} (security/trust error).\n"
+                "Fix: In Word → Options → Trust Center → Trusted Locations → "
+                "add your sermon folder. Or run in PowerShell: "
+                "Get-ChildItem 'E:\\your\\sermons' -Recurse | Unblock-File"
+            ) from e
         raise ParseError(f"Word COM failed on {path.name}: {e}") from e
     finally:
         if doc is not None:
@@ -349,11 +358,21 @@ def make_doc_id(stem: str) -> str:
 
 
 def quarantine(path: Path, reason: str, root: str, dry_run: bool = False) -> None:
-    """Copy (not move) file to quarantine/<reason>/ subdirectory."""
+    """Copy (not move) file to quarantine/<reason>/ subdirectory.
+
+    Silently skips the copy if the destination already exists or is not writable
+    (e.g. a re-run over a partially-completed ingest).
+    """
     dest_dir = Path(root) / reason
     if not dry_run:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(path), str(dest_dir / path.name))
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / path.name
+            if dest.exists():
+                return  # already quarantined from a previous run
+            shutil.copy2(str(path), str(dest))
+        except PermissionError as e:
+            print(f"  WARNING: could not quarantine {path.name}: {e}", file=sys.stderr)
 
 
 def write_document_json(doc: dict, out_dir: str) -> None:
