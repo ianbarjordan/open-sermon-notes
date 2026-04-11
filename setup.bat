@@ -51,10 +51,16 @@ pip install -r build\requirements_build.txt
 echo Installing app dependencies...
 pip install -r app\requirements_app.txt
 
-:: Verify pywin32 (required for .doc parsing via Word COM)
-python -c "import win32com.client; print('pywin32 OK')" 2>nul || (
-    echo Attempting pywin32 post-install...
-    python .venv\Lib\site-packages\pywin32_postinstall.py -install 2>nul
+:: pywin32 post-install — must run to register COM components for .doc parsing.
+:: Requires Administrator privileges; setup.bat should be run as Administrator.
+echo Running pywin32 post-install registration...
+python .venv\Lib\site-packages\pywin32_postinstall.py -install
+python -c "import win32com.client; print('pywin32 OK')" || (
+    echo.
+    echo WARNING: pywin32 COM registration failed.
+    echo Re-run setup.bat as Administrator ^(right-click -^> Run as administrator^).
+    echo .doc files will not parse until this is resolved.
+    echo.
 )
 
 :: Download LLM model (~2.4 GB, one-time)
