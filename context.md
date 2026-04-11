@@ -113,7 +113,8 @@ A single Word COM instance is opened once per ingest run on Windows (not per fil
 | `CTX_WINDOW` | `4096` | Phi-3.5-mini context length |
 | `N_GPU_LAYERS` | `0` | Set >0 to offload layers to GPU |
 | `N_THREADS` | `max(1, cpu_count//2)` | Guards against `None` on some VMs |
-| `TOP_K` | `5` | Chunks returned to LLM |
+| `TOP_K` | `5` | Default chunks returned to LLM |
+| `MAX_TOP_K` | `15` | Slider upper bound in Gradio UI |
 | `RRF_K` | `60` | Reciprocal Rank Fusion constant |
 | `CONFIDENCE_THRESHOLD` | `0.005` | Min RRF score (max ~0.033 with K=60) |
 | `MIN_CHUNK_WORDS` | `50` | Discard chunks shorter than this |
@@ -228,6 +229,40 @@ python app\app.py --port 7860
 ```
 
 Open `http://127.0.0.1:7860` in your browser.
+
+---
+
+## Production Readiness Features (Sprint 2)
+
+### Incremental Indexing
+- `build/01_ingest_files.py` now maintains `data/processed.json` — a persistent
+  `{source_path: sha256}` registry. On each run, previously accepted file hashes are
+  pre-loaded so cross-session duplicates are detected. Registry is saved atomically at end.
+- `build/02_chunk_embed.py` accepts `--incremental` flag. When set, it loads the existing
+  FAISS index + SQLite DB, finds doc_ids not yet indexed, embeds only those, appends vectors
+  via `index.add()`, and extends `id_map.json`. Full rebuild is unchanged (no flag or `--force`).
+
+### GUI Changes (`app/app.py`)
+- **Theme:** `gr.themes.Soft()` with custom CSS (hides Gradio footer, styled answer box)
+- **Result count slider:** 1–15 results (configurable via `MAX_TOP_K` in config.py)
+- **Enter-to-search:** `query_box.submit()` is wired alongside `search_btn.click()`; both
+  pass `[query_box, top_k_slider]` as inputs
+- **Clickable row file open:** `results_df.select()` replaces the old Number + Button pattern;
+  clicking any row opens the source file in the OS default app; `open_status` shows feedback
+- **Manage Archive tab:** folder path input + "Process New Files" (incremental) and
+  "Full Rebuild" buttons; captured subprocess stdout/stderr shown in log textbox; retriever
+  reloaded in-place after each operation
+- **Source File column:** displays basename only (full path stored in `chunks_state`)
+
+### Windows Deployment
+- `setup.bat` — first-time setup: checks Python 3.11, installs uv, creates venv, installs
+  PyTorch CPU + all dependencies, verifies pywin32, downloads LLM model
+- `launch.bat` — one-click start: activates venv, opens browser, launches `app/app.py`
+
+### Scalability Notes
+- `IndexFlatL2` at 55k vectors (384-dim) scans in ~2–5ms; no IVF needed until ~1M vectors
+- First full ingest of 14k files may take overnight on Windows (COM automation bottleneck)
+- Subsequent incremental runs touch only new files — expected seconds for small batches
 
 ---
 

@@ -6,6 +6,7 @@ Usage:
     python build/02_chunk_embed.py --dry-run
     python build/02_chunk_embed.py
     python build/02_chunk_embed.py --force
+    python build/02_chunk_embed.py --incremental
 """
 import argparse
 import json
@@ -229,6 +230,102 @@ def build_index(docs: list[dict], model, conn: sqlite3.Connection, batch_size: i
     return index, id_map
 
 
+def build_index_incremental(
+    new_docs: list[dict],
+    model,
+    conn: sqlite3.Connection,
+    existing_index,
+    existing_id_map: dict,
+    batch_size: int,
+) -> tuple:
+    """Append-only update: embed new_docs and add to existing FAISS + FTS5.
+
+    Returns (updated_index, updated_id_map).
+    """
+    import numpy as np
+
+    offset = existing_index.ntotal
+    id_map = dict(existing_id_map)
+
+    all_texts: list[str] = []
+    all_chunk_ids: list[str] = []
+    chunk_docs: list[dict] = []
+
+    print(f"Chunking {len(new_docs)} new documents...")
+    for doc in new_docs:
+        text = doc.get('text', '')
+        if not text:
+            continue
+        chunks = chunk_document(text, COMMENTARY_CHUNK_WORDS, MIN_CHUNK_WORDS)
+        for idx, chunk in enumerate(chunks):
+            chunk_id = f"{doc['doc_id']}::{idx}"
+            all_texts.append(chunk)
+            all_chunk_ids.append(chunk_id)
+            chunk_docs.append(doc)
+
+    print(f"New chunks: {len(all_texts)}")
+
+    if not all_texts:
+        print("No new chunks to embed. Index is already up to date.")
+        return existing_index, id_map
+
+    print(f"Embedding with {EMBED_MODEL} (batch={batch_size})...")
+    try:
+        from tqdm import tqdm
+        bar = tqdm(total=len(all_texts), unit='chunk')
+    except ImportError:
+        bar = None
+
+    all_vecs_list = []
+    for i in range(0, len(all_texts), batch_size):
+        batch = all_texts[i:i + batch_size]
+        vecs = model.encode(batch, normalize_embeddings=True, show_progress_bar=False)
+        all_vecs_list.append(vecs)
+        if bar:
+            bar.update(len(batch))
+    if bar:
+        bar.close()
+
+    embeddings = np.vstack(all_vecs_list).astype('float32')
+
+    # Append to FAISS in-place
+    existing_index.add(embeddings)
+    print(f"FAISS index: {existing_index.ntotal} vectors total (+{len(all_texts)} new)")
+
+    # Extend id_map
+    for i, chunk_id in enumerate(all_chunk_ids):
+        id_map[offset + i] = chunk_id
+
+    # Insert into SQLite (INSERT OR IGNORE for documents, plain insert for chunks)
+    print("Writing new chunks to SQLite FTS5...")
+    seen_docs: set = set()
+    for chunk_id, chunk_text, doc in zip(all_chunk_ids, all_texts, chunk_docs):
+        if doc['doc_id'] not in seen_docs:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO documents
+                    (doc_id, source_file, title, scripture_ref, date, format, word_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    doc['doc_id'],
+                    doc['source_file'],
+                    doc.get('title'),
+                    doc.get('scripture_ref'),
+                    doc.get('date'),
+                    doc.get('format'),
+                    doc.get('word_count'),
+                ),
+            )
+            seen_docs.add(doc['doc_id'])
+        insert_chunk_fts(conn, chunk_id, doc, chunk_text)
+
+    conn.commit()
+    print(f"SQLite: +{len(seen_docs)} new documents, +{len(all_texts)} new chunks")
+
+    return existing_index, id_map
+
+
 def save_artifacts(index, id_map: dict, faiss_path: str, idmap_path: str) -> None:
     """Save FAISS index and id_map JSON."""
     import faiss
@@ -263,10 +360,12 @@ def main() -> None:
                         help=f'Embedding model (default: {EMBED_MODEL})')
     parser.add_argument('--batch',   metavar='INT',  type=int, default=64,
                         help='Batch size for embedding (default: 64)')
-    parser.add_argument('--force',   action='store_true',
+    parser.add_argument('--force',       action='store_true',
                         help='Drop and rebuild existing index')
-    parser.add_argument('--dry-run', action='store_true',
+    parser.add_argument('--dry-run',     action='store_true',
                         help='Chunk/count only, no writes')
+    parser.add_argument('--incremental', action='store_true',
+                        help='Append only new documents to existing index')
     args = parser.parse_args()
 
     docs = load_documents(args.docs)
@@ -288,15 +387,51 @@ def main() -> None:
     from sentence_transformers import SentenceTransformer
     model = SentenceTransformer(args.model)
 
-    # Init DB
+    if args.incremental:
+        import faiss
+
+        faiss_file = Path(args.faiss)
+        idmap_file = Path(args.idmap)
+
+        if not faiss_file.exists() or not idmap_file.exists():
+            print("No existing index found — falling back to full build.")
+            conn = init_db(args.db, force=False)
+            index, id_map = build_index(docs, model, conn, args.batch)
+        else:
+            # Load existing artifacts
+            existing_index = faiss.read_index(str(faiss_file))
+            with open(idmap_file, encoding='utf-8') as fh:
+                raw = json.load(fh)
+            existing_id_map = {int(k): v for k, v in raw.items()}
+
+            conn = init_db(args.db, force=False)
+
+            # Find doc_ids already in DB
+            existing_ids = {
+                row[0]
+                for row in conn.execute("SELECT doc_id FROM documents").fetchall()
+            }
+            new_docs = [d for d in docs if d['doc_id'] not in existing_ids]
+            print(f"Already indexed: {len(existing_ids)} docs. New docs: {len(new_docs)}")
+
+            if not new_docs:
+                print("Index is already up to date. Nothing to add.")
+                conn.close()
+                return
+
+            index, id_map = build_index_incremental(
+                new_docs, model, conn, existing_index, existing_id_map, args.batch
+            )
+
+        save_artifacts(index, id_map, args.faiss, args.idmap)
+        conn.close()
+        print("Done (incremental).")
+        return
+
+    # Full build (default)
     conn = init_db(args.db, force=args.force)
-
-    # Build
     index, id_map = build_index(docs, model, conn, args.batch)
-
-    # Save
     save_artifacts(index, id_map, args.faiss, args.idmap)
-
     conn.close()
     print("Done.")
 

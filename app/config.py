@@ -20,7 +20,8 @@ USE_MMAP            = True
 # ---------------------------------------------------------------------------
 # Retrieval
 # ---------------------------------------------------------------------------
-TOP_K               = 5        # Final number of chunks returned to the LLM
+TOP_K               = 5        # Default number of chunks returned to the LLM
+MAX_TOP_K           = 15       # Maximum allowed result count (slider upper bound)
 RRF_K               = 60       # Reciprocal Rank Fusion constant
 NPROBE              = 64       # FAISS IVF probe count (higher = slower but more accurate)
 CONFIDENCE_THRESHOLD = 0.005   # Minimum RRF score to include a result (RRF max ~0.033 with K=60)

@@ -7,17 +7,29 @@ Usage:
 """
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from app.config import DB_PATH, FAISS_PATH, ID_MAP_PATH, LOW_CONFIDENCE_THRESHOLD, MODEL_PATH  # noqa: E402
+from app.config import (  # noqa: E402
+    DB_PATH,
+    FAISS_PATH,
+    ID_MAP_PATH,
+    LOW_CONFIDENCE_THRESHOLD,
+    MAX_TOP_K,
+    MODEL_PATH,
+    TOP_K,
+)
 
 # ---------------------------------------------------------------------------
 # Global retriever + LLM (loaded once at startup)
 # ---------------------------------------------------------------------------
 _retriever = None
 _llm = None
+
+# Project root (parent of app/)
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
 def _load_components(
@@ -58,10 +70,10 @@ def _load_components(
 # Query handler
 # ---------------------------------------------------------------------------
 
-def handle_query(query: str):
+def handle_query(query: str, top_k: int = TOP_K):
     """Search handler — returns (answer, dataframe_rows, status, chunks_state).
 
-    chunks_state is stored in a gr.State so the Open File handler can access it.
+    chunks_state is stored in a gr.State so the row-click handler can access it.
     """
     empty = ("Please enter a question.", [], "No query.", [])
 
@@ -72,7 +84,7 @@ def handle_query(query: str):
         return ("Retriever is not available. Check startup logs.", [], "Error: retriever not loaded", [])
 
     try:
-        chunks = _retriever.search(query)
+        chunks = _retriever.search(query, top_k=int(top_k))
     except Exception as e:
         return (f"Retrieval error: {e}", [], f"Error: {e}", [])
 
@@ -98,11 +110,13 @@ def handle_query(query: str):
     RRF_MAX = 2.0 / 61.0
     max_score = max(c.get('score', 0) for c in chunks)
 
-    # Build dataframe rows
+    # Build dataframe rows — display basename for Source File column
     rows = []
     for i, c in enumerate(chunks):
         snippet = (c.get('text') or '')[:120] + '...'
         match_pct = f"{min(c.get('score', 0) / RRF_MAX * 100, 100):.0f}%"
+        source_path = c.get('source_file') or ''
+        source_display = Path(source_path).name if source_path else ''
         rows.append([
             i + 1,
             c.get('title') or '',
@@ -110,7 +124,7 @@ def handle_query(query: str):
             c.get('date') or '',
             snippet,
             match_pct,
-            c.get('source_file') or '',
+            source_display,
         ])
 
     if max_score < LOW_CONFIDENCE_THRESHOLD:
@@ -126,37 +140,28 @@ def handle_query(query: str):
 
 
 # ---------------------------------------------------------------------------
-# Open file handler
+# Row-click file open handler
 # ---------------------------------------------------------------------------
 
-def open_file(result_num: int, chunks_state: list) -> str:
-    """Open the Nth result file in the OS default application (Word / PowerPoint).
-
-    Uses os.startfile() on Windows, subprocess on Linux/macOS.
-    """
-    if not chunks_state:
-        return "No search results to open. Run a search first."
-
-    idx = int(result_num) - 1
-    if idx < 0 or idx >= len(chunks_state):
-        return f"Result #{int(result_num)} does not exist (only {len(chunks_state)} results)."
-
-    source = chunks_state[idx].get('source_file', '')
+def on_row_select(evt, chunks_state: list) -> str:
+    """Fires when any cell in results_df is clicked. Opens source file for that row."""
+    if evt is None:
+        return ""
+    row_index = evt.index[0]
+    if not chunks_state or row_index >= len(chunks_state):
+        return "No result selected."
+    source = chunks_state[row_index].get('source_file', '')
     if not source:
-        return "No file path recorded for this result."
-
+        return "Source file path not available."
     path = Path(source).resolve()
     if not path.exists():
-        return f"File not found on disk: {path}"
-
+        return f"File not found: {path}"
     try:
         if sys.platform == 'win32':
             os.startfile(str(path))
         elif sys.platform == 'darwin':
-            import subprocess
             subprocess.run(['open', str(path)], check=True)
         else:
-            import subprocess
             subprocess.run(['xdg-open', str(path)], check=True)
         return f"Opened: {path.name}"
     except Exception as e:
@@ -164,64 +169,192 @@ def open_file(result_num: int, chunks_state: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Manage Archive handlers
+# ---------------------------------------------------------------------------
+
+def _run_subprocess(cmd: list[str]) -> str:
+    """Run a subprocess, capture stdout+stderr, return combined output."""
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=_PROJECT_ROOT,
+        )
+        out = result.stdout
+        if result.stderr:
+            out += "\n[stderr]\n" + result.stderr
+        if result.returncode != 0:
+            out += f"\n[exit code: {result.returncode}]"
+        return out
+    except Exception as e:
+        return f"Subprocess error: {e}"
+
+
+def process_new_files(folder: str) -> str:
+    """Ingest + incremental embed for a new folder of sermon files."""
+    if not folder or not folder.strip():
+        return "Please enter a folder path."
+
+    log = f"=== Processing new files from: {folder} ===\n\n"
+
+    log += "--- Step 1: Ingest files ---\n"
+    log += _run_subprocess([sys.executable, "build/01_ingest_files.py", "--source", folder, "--verbose"])
+    log += "\n\n--- Step 2: Incremental embed ---\n"
+    log += _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--incremental"])
+
+    # Reload retriever in-place
+    log += "\n\n--- Reloading retriever ---\n"
+    try:
+        from app.retriever import load_retriever
+        global _retriever
+        _retriever = load_retriever(
+            db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH
+        )
+        log += "Retriever reloaded successfully.\n"
+    except Exception as e:
+        log += f"Retriever reload failed: {e}\n"
+
+    return log
+
+
+def full_rebuild(folder: str) -> str:
+    """Full ingest (force) + full embed rebuild."""
+    if not folder or not folder.strip():
+        return "Please enter a folder path."
+
+    log = f"=== Full rebuild from: {folder} ===\n\n"
+
+    log += "--- Step 1: Ingest files (force) ---\n"
+    log += _run_subprocess([
+        sys.executable, "build/01_ingest_files.py",
+        "--source", folder, "--force", "--verbose",
+    ])
+    log += "\n\n--- Step 2: Full embed rebuild ---\n"
+    log += _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--force"])
+
+    # Reload retriever in-place
+    log += "\n\n--- Reloading retriever ---\n"
+    try:
+        from app.retriever import load_retriever
+        global _retriever
+        _retriever = load_retriever(
+            db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH
+        )
+        log += "Retriever reloaded successfully.\n"
+    except Exception as e:
+        log += f"Retriever reload failed: {e}\n"
+
+    return log
+
+
+# ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
+
+CSS = """
+#search-col { max-width: 860px; margin: auto; }
+.answer-box { background: #f8f8f5; border-radius: 8px; padding: 1rem; }
+.results-table { font-size: 0.88rem; }
+footer { display: none !important; }
+"""
+
 
 def build_ui():
     import gradio as gr
 
-    with gr.Blocks(title="AI-Powered Sermon Note Search") as demo:
-        gr.Markdown("# AI-Powered Sermon Note Search")
-        gr.Markdown("Search your sermon archive.")
+    with gr.Blocks(title="Sermon Note Search", theme=gr.themes.Soft(), css=CSS) as demo:
+        gr.Markdown("# Sermon Note Search")
 
-        # Hidden state — holds the last set of retrieved chunks for the Open handler
-        chunks_state = gr.State([])
+        with gr.Tabs():
 
-        with gr.Row():
-            query_box = gr.Textbox(
-                label="Your question",
-                lines=2,
-                placeholder='e.g. "What did I preach about forgiveness?"',
-                scale=4,
-            )
-            search_btn = gr.Button("Search", variant="primary", scale=1)
+            # ----------------------------------------------------------------
+            # Search tab
+            # ----------------------------------------------------------------
+            with gr.Tab("Search"):
+                chunks_state = gr.State([])
 
-        answer_md = gr.Markdown(label="Answer", value="")
+                with gr.Row(elem_id="search-col"):
+                    query_box = gr.Textbox(
+                        label="Your question",
+                        lines=3,
+                        placeholder="Ask about a topic, scripture, or season…",
+                        scale=4,
+                    )
+                    top_k_slider = gr.Slider(
+                        minimum=1,
+                        maximum=MAX_TOP_K,
+                        value=TOP_K,
+                        step=1,
+                        label="Results",
+                        scale=1,
+                    )
 
-        results_df = gr.Dataframe(
-            headers=["#", "Title", "Scripture", "Date", "Snippet", "Match %", "Source File"],
-            datatype=["number", "str", "str", "str", "str", "str", "str"],
-            label="Source Chunks",
-            wrap=True,
-        )
+                search_btn = gr.Button("Search", variant="primary")
 
-        # Open file row
-        with gr.Row():
-            result_num = gr.Number(
-                value=1,
-                minimum=1,
-                maximum=5,
-                step=1,
-                label="Result #",
-                scale=1,
-            )
-            open_btn = gr.Button("Open File", scale=2)
-            open_status = gr.Textbox(
-                label="",
-                interactive=False,
-                scale=4,
-                show_label=False,
-            )
+                answer_md = gr.Markdown(
+                    label="Answer",
+                    value="",
+                    elem_classes=["answer-box"],
+                )
 
-        status_md = gr.Markdown(value="")
+                gr.HTML("<hr style='border:none;border-top:1px solid #ddd;margin:0.5rem 0'>")
 
-        # Search events
-        search_outputs = [answer_md, results_df, status_md, chunks_state]
-        search_btn.click(fn=handle_query, inputs=[query_box], outputs=search_outputs)
-        query_box.submit(fn=handle_query, inputs=[query_box], outputs=search_outputs)
+                results_df = gr.Dataframe(
+                    headers=["#", "Title", "Scripture", "Date", "Snippet", "Match %", "Source File"],
+                    datatype=["number", "str", "str", "str", "str", "str", "str"],
+                    label="Source Chunks  (click a row to open the file)",
+                    wrap=True,
+                    elem_classes=["results-table"],
+                )
 
-        # Open file event
-        open_btn.click(fn=open_file, inputs=[result_num, chunks_state], outputs=[open_status])
+                open_status = gr.Textbox(
+                    label="",
+                    interactive=False,
+                    show_label=False,
+                    placeholder="Click a result row to open the file…",
+                )
+
+                status_md = gr.Markdown(value="")
+
+                # Search events
+                search_inputs = [query_box, top_k_slider]
+                search_outputs = [answer_md, results_df, status_md, chunks_state]
+                search_btn.click(fn=handle_query, inputs=search_inputs, outputs=search_outputs)
+                query_box.submit(fn=handle_query, inputs=search_inputs, outputs=search_outputs)
+
+                # Row-click file open
+                results_df.select(fn=on_row_select, inputs=[chunks_state], outputs=[open_status])
+
+            # ----------------------------------------------------------------
+            # Manage Archive tab
+            # ----------------------------------------------------------------
+            with gr.Tab("Manage Archive"):
+                gr.Markdown(
+                    "### Add or rebuild the sermon archive\n"
+                    "Enter the path to a folder containing new sermon files, "
+                    "then choose an action."
+                )
+
+                folder_box = gr.Textbox(
+                    label="New sermon files folder",
+                    placeholder=r"e.g. C:\Sermons\2025  or  ./new_sermons",
+                    lines=1,
+                )
+
+                with gr.Row():
+                    process_btn = gr.Button("➕ Process New Files", variant="primary")
+                    rebuild_btn = gr.Button("🔄 Full Rebuild", variant="secondary")
+
+                archive_log = gr.Textbox(
+                    label="Output log",
+                    interactive=False,
+                    lines=12,
+                    max_lines=20,
+                )
+
+                process_btn.click(fn=process_new_files, inputs=[folder_box], outputs=[archive_log])
+                rebuild_btn.click(fn=full_rebuild, inputs=[folder_box], outputs=[archive_log])
 
     return demo
 

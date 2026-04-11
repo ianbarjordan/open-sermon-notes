@@ -21,6 +21,40 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.config import MIN_CHUNK_WORDS  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Persistent dedup registry
+# ---------------------------------------------------------------------------
+PROCESSED_REGISTRY = "data/processed.json"
+
+
+def load_registry(registry_path: str) -> dict:
+    """Load {source_path: sha256} registry from disk. Returns empty dict if missing."""
+    p = Path(registry_path)
+    if p.exists():
+        try:
+            with open(p, encoding='utf-8') as fh:
+                return json.load(fh)
+        except Exception as e:
+            print(f"WARNING: could not load registry {registry_path}: {e}", file=sys.stderr)
+    return {}
+
+
+def save_registry(registry: dict, registry_path: str) -> None:
+    """Atomically write the registry back to disk."""
+    p = Path(registry_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), suffix='.tmp')
+    try:
+        with os.fdopen(tmp_fd, 'w', encoding='utf-8') as fh:
+            json.dump(registry, fh, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, str(p))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 from build.format_detect import detect_format  # noqa: E402
 from build.parse_filename import parse_filename  # noqa: E402
 
@@ -350,6 +384,7 @@ def ingest_file(
     dry_run: bool = False,
     force: bool = False,
     verbose: bool = False,
+    registry: dict | None = None,
 ) -> str:
     """Ingest a single file through the quarantine pipeline.
 
@@ -443,6 +478,8 @@ def ingest_file(
         quarantine(path, 'duplicates', quarantine_root, dry_run)
         return 'duplicates'
     seen_hashes.add(sha)
+    if registry is not None and not dry_run:
+        registry[path.as_posix()] = sha
 
     # Step 10: Accepted — build document JSON
     meta = parse_filename(stem)
@@ -498,6 +535,8 @@ def main() -> None:
                         help='Re-process files that already have JSON output')
     parser.add_argument('--verbose',    action='store_true',
                         help='Per-file decisions to stdout')
+    parser.add_argument('--registry',   metavar='PATH', default=PROCESSED_REGISTRY,
+                        help=f'Persistent hash registry (default: {PROCESSED_REGISTRY})')
     args = parser.parse_args()
 
     files = collect_files(args.source)
@@ -512,8 +551,12 @@ def main() -> None:
     if args.dry_run:
         print("DRY RUN — no files will be written")
 
+    # Load persistent registry and pre-populate seen_hashes
+    registry: dict = load_registry(args.registry) if not args.dry_run else {}
+    seen_hashes: set = set(registry.values())
+    print(f"Registry: {len(registry)} previously accepted files")
+
     counts: dict[str, int] = {}
-    seen_hashes: set = set()
 
     try:
         from tqdm import tqdm
@@ -531,11 +574,17 @@ def main() -> None:
                 dry_run=args.dry_run,
                 force=args.force,
                 verbose=args.verbose,
+                registry=registry,
             )
             counts[outcome] = counts.get(outcome, 0) + 1
     finally:
         # Always close the Word COM instance if it was opened on Windows
         _close_win_word_app()
+
+    # Save updated registry
+    if not args.dry_run:
+        save_registry(registry, args.registry)
+        print(f"Registry saved: {len(registry)} entries → {args.registry}")
 
     print("\n--- Ingest Summary ---")
     total = sum(counts.values())
