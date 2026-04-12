@@ -143,21 +143,66 @@ def handle_query(query: str, top_k: int = TOP_K):
 # Row-click file open handler
 # ---------------------------------------------------------------------------
 
+def _extract_row_index(evt) -> int | None:
+    """Extract the clicked row index from whatever Gradio passes to a select handler.
+
+    Gradio 5.x passes SelectData (has .index attribute).
+    Some builds pass a plain (row, col) tuple of ints.
+    If neither is detected (e.g. full dataframe value passed), returns None.
+    """
+    # Standard: SelectData with .index = [row, col] or just row int
+    if hasattr(evt, 'index'):
+        idx = evt.index
+        if isinstance(idx, (list, tuple)):
+            return int(idx[0])
+        return int(idx)
+    # Plain (row, col) tuple — both elements must be numbers
+    if isinstance(evt, (list, tuple)) and evt and isinstance(evt[0], (int, float)):
+        return int(evt[0])
+    return None
+
+
 def on_row_select(evt, chunks_state: list) -> str:
     """Fires when any cell in results_df is clicked. Opens source file for that row."""
     if evt is None:
         return ""
-    # Gradio passes SelectData in most builds, but some 5.x versions pass a
-    # plain (row, col) tuple directly — handle both.
-    if isinstance(evt, (list, tuple)):
-        row_index = int(evt[0])
-    else:
-        row_index = int(evt.index[0])
+    row_index = _extract_row_index(evt)
+    if row_index is None:
+        return "Row click unavailable in this Gradio build — use the Result # field below."
     if not chunks_state or row_index >= len(chunks_state):
         return "No result selected."
     source = chunks_state[row_index].get('source_file', '')
     if not source:
         return "Source file path not available."
+    path = Path(source).resolve()
+    if not path.exists():
+        return f"File not found: {path}"
+    try:
+        if sys.platform == 'win32':
+            os.startfile(str(path))
+        elif sys.platform == 'darwin':
+            subprocess.run(['open', str(path)], check=True)
+        else:
+            subprocess.run(['xdg-open', str(path)], check=True)
+        return f"Opened: {path.name}"
+    except Exception as e:
+        return f"Could not open file: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Number-input file open (reliable fallback for all Gradio versions)
+# ---------------------------------------------------------------------------
+
+def open_file(result_num: int, chunks_state: list) -> str:
+    """Open the Nth result file. Used by the Result # + Open File button."""
+    if not chunks_state:
+        return "No search results. Run a search first."
+    idx = int(result_num) - 1
+    if idx < 0 or idx >= len(chunks_state):
+        return f"Result #{int(result_num)} does not exist ({len(chunks_state)} results)."
+    source = chunks_state[idx].get('source_file', '')
+    if not source:
+        return "No file path for this result."
     path = Path(source).resolve()
     if not path.exists():
         return f"File not found: {path}"
@@ -282,7 +327,8 @@ def build_ui():
                 with gr.Row(elem_id="search-col"):
                     query_box = gr.Textbox(
                         label="Your question",
-                        lines=3,
+                        lines=1,
+                        max_lines=6,
                         placeholder="Ask about a topic, scripture, or season…",
                         scale=4,
                     )
@@ -314,12 +360,17 @@ def build_ui():
                     row_count=(15, "fixed"),
                 )
 
-                open_status = gr.Textbox(
-                    label="",
-                    interactive=False,
-                    show_label=False,
-                    placeholder="Click a result row to open the file…",
-                )
+                with gr.Row():
+                    result_num = gr.Number(
+                        value=1, minimum=1, maximum=MAX_TOP_K, step=1,
+                        label="Result #", scale=1,
+                    )
+                    open_btn = gr.Button("Open File", scale=2)
+                    open_status = gr.Textbox(
+                        label="", interactive=False, show_label=False,
+                        placeholder="Click a row or enter Result # and click Open File…",
+                        scale=4,
+                    )
 
                 status_md = gr.Markdown(value="")
 
@@ -329,8 +380,10 @@ def build_ui():
                 search_btn.click(fn=handle_query, inputs=search_inputs, outputs=search_outputs)
                 query_box.submit(fn=handle_query, inputs=search_inputs, outputs=search_outputs)
 
-                # Row-click file open
+                # Row-click file open (best-effort — depends on Gradio build)
                 results_df.select(fn=on_row_select, inputs=[chunks_state], outputs=[open_status])
+                # Reliable fallback: Result # number input + button
+                open_btn.click(fn=open_file, inputs=[result_num, chunks_state], outputs=[open_status])
 
             # ----------------------------------------------------------------
             # Manage Archive tab
