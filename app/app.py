@@ -147,7 +147,12 @@ def on_row_select(evt, chunks_state: list) -> str:
     """Fires when any cell in results_df is clicked. Opens source file for that row."""
     if evt is None:
         return ""
-    row_index = evt.index[0]
+    # Gradio passes SelectData in most builds, but some 5.x versions pass a
+    # plain (row, col) tuple directly — handle both.
+    if isinstance(evt, (list, tuple)):
+        row_index = int(evt[0])
+    else:
+        row_index = int(evt.index[0])
     if not chunks_state or row_index >= len(chunks_state):
         return "No result selected."
     source = chunks_state[row_index].get('source_file', '')
@@ -306,6 +311,7 @@ def build_ui():
                     label="Source Chunks  (click a row to open the file)",
                     wrap=True,
                     elem_classes=["results-table"],
+                    row_count=(15, "fixed"),
                 )
 
                 open_status = gr.Textbox(

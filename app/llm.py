@@ -32,13 +32,25 @@ asks for more detail.\
 """
 
 
-def _format_chunk(i: int, chunk: dict) -> str:
+# Max chunks sent to the LLM regardless of how many the user requested.
+# The table shows all top_k results; the LLM only reads the top few to stay
+# within the 4096-token context window.
+_LLM_MAX_CHUNKS = 4
+# Approx chars per token; used to budget text length per chunk.
+_CHARS_PER_TOKEN = 4
+# Reserve tokens for system prompt (~220), user header/footer (~80), answer (~512).
+_RESERVED_TOKENS = 820
+# Tokens available for all chunk text combined.
+_CHUNK_TOKEN_BUDGET = CTX_WINDOW - _RESERVED_TOKENS   # ~3276 with CTX_WINDOW=4096
+
+
+def _format_chunk(i: int, chunk: dict, max_text_chars: int = 800) -> str:
     """Format a single chunk for the context block in the user message."""
     title = chunk.get('title') or '(untitled)'
     scripture = chunk.get('scripture_ref')
     date = chunk.get('date')
     source = chunk.get('source_file') or ''
-    text = chunk.get('text') or ''
+    text = (chunk.get('text') or '')[:max_text_chars]
 
     header = f'[{i}] "{title}"'
     if scripture:
@@ -49,7 +61,10 @@ def _format_chunk(i: int, chunk: dict) -> str:
 
 
 def _build_user_message(query: str, chunks: list[dict]) -> str:
-    excerpts = '\n\n'.join(_format_chunk(i + 1, c) for i, c in enumerate(chunks))
+    # Limit to top N chunks and budget text length across them
+    top = chunks[:_LLM_MAX_CHUNKS]
+    max_text_chars = max(200, (_CHUNK_TOKEN_BUDGET * _CHARS_PER_TOKEN) // max(len(top), 1))
+    excerpts = '\n\n'.join(_format_chunk(i + 1, c, max_text_chars) for i, c in enumerate(top))
     return f"Sermon excerpts:\n\n{excerpts}\n\n---\nQuestion: {query}"
 
 
