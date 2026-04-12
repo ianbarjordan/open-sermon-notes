@@ -177,17 +177,22 @@ cd open-sermon-notes
 uv venv .venv --python 3.11
 .venv\Scripts\activate
 
-# Torch CPU build (sufficient for embeddings + inference)
+# PyTorch — choose CPU or CUDA build:
+# CPU only (smaller, works everywhere):
 pip install torch --index-url https://download.pytorch.org/whl/cpu
+# NVIDIA GPU (CUDA 12.x driver or newer — cu128 is compatible with CUDA 13.x drivers):
+pip install torch --index-url https://download.pytorch.org/whl/cu128
 
 # All other dependencies (pywin32 installed automatically on Windows)
-pip install -r build/requirements_build.txt
-pip install -r app/requirements_app.txt
+uv pip install -r sermon-notes-offline\build\requirements_build.txt --python .venv\Scripts\python.exe
+uv pip install -r sermon-notes-offline\app\requirements_app.txt --python .venv\Scripts\python.exe
 
-# Verify pywin32 is working (pywin32>=306 installed via uv/pip does not need a post-install step)
+# Verify pywin32 COM registration (must be run as Administrator)
+python .venv\Lib\site-packages\pywin32_postinstall.py -install
 python -c "import win32com.client; print('pywin32 OK')"
-# If that fails, run the post-install script manually:
-# python .venv\Lib\site-packages\pywin32_postinstall.py -install
+
+# Verify GPU (optional)
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
 ### Linux / WSL
@@ -263,6 +268,23 @@ Open `http://127.0.0.1:7860` in your browser.
 - `IndexFlatL2` at 55k vectors (384-dim) scans in ~2–5ms; no IVF needed until ~1M vectors
 - First full ingest of 14k files may take overnight on Windows (COM automation bottleneck)
 - Subsequent incremental runs touch only new files — expected seconds for small batches
+
+### GPU Embedding
+`sentence-transformers` uses CUDA automatically when `torch.cuda.is_available()` is `True`.
+The CPU PyTorch build installed by `setup.bat` must be replaced with a CUDA build:
+```bat
+.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu128 --force-reinstall
+```
+- `cu128` is compatible with CUDA 12.x **and** 13.x drivers (PyTorch does not yet ship a cu132 build)
+- Verify: `.venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available())"`
+- GPU embedding of ~11k docs takes ~2–5 min vs 20–30 min on CPU
+
+### Production Corpus (April 2026)
+- **14,110 files** processed from 27+ years of sermons
+- **10,192 accepted** → JSON docs in `data/documents/`
+- **~60k+ FAISS vectors** (IndexFlatL2, 384-dim)
+- **581 manual_review** — mostly Word-blocked `.doc` files; recoverable by adding sermon
+  folder to Word Trusted Locations then re-running ingest + `--incremental` embed
 
 ---
 
