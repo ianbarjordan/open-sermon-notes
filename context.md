@@ -250,14 +250,29 @@ Open `http://127.0.0.1:7860` in your browser.
 ### GUI Changes (`app/app.py`)
 - **Theme:** `gr.themes.Soft()` with custom CSS (hides Gradio footer, styled answer box)
 - **Result count slider:** 1–15 results (configurable via `MAX_TOP_K` in config.py)
-- **Enter-to-search:** `query_box.submit()` is wired alongside `search_btn.click()`; both
-  pass `[query_box, top_k_slider]` as inputs
-- **Clickable row file open:** `results_df.select()` replaces the old Number + Button pattern;
-  clicking any row opens the source file in the OS default app; `open_status` shows feedback
+- **Enter-to-search:** `query_box` uses `lines=1, max_lines=6`; Enter key submits via
+  `query_box.submit()` wired alongside `search_btn.click()`
+- **Row click file open:** `results_df.select()` calls `on_row_select()` which uses
+  `_extract_row_index()` to handle both `gr.SelectData` and plain `(row, col)` tuple forms
+  across Gradio versions; gracefully falls back with a message if row index is undetectable
+- **Result # + Open File button:** reliable fallback always present — enter row number,
+  click Open File; works in all Gradio builds
+- **LLM context budget:** `llm.py` caps chunks sent to LLM at 4 (`_LLM_MAX_CHUNKS`),
+  truncates text per chunk to fit within 4096-token window; table still shows all `top_k`
 - **Manage Archive tab:** folder path input + "Process New Files" (incremental) and
   "Full Rebuild" buttons; captured subprocess stdout/stderr shown in log textbox; retriever
   reloaded in-place after each operation
 - **Source File column:** displays basename only (full path stored in `chunks_state`)
+- **Dataframe:** `row_count=(15, "fixed")` — all rows rendered upfront
+
+### Known Gradio Compatibility Notes
+- `Dataframe.select()` event passes `gr.SelectData` in standard Gradio 5.x builds, but
+  some builds pass the full dataframe value (list of row dicts) instead — `_extract_row_index()`
+  handles this gracefully and falls back to the Result # button
+- `pywin32` post-install registration requires **Administrator** privileges on Windows;
+  `pip install pywin32` (not uv) runs registration automatically as part of the wheel install
+- All install commands must be run from inside `open-sermon-notes\` (the repo root where
+  `.venv\` lives), not from parent directories
 
 ### Windows Deployment
 - `setup.bat` — first-time setup: checks Python 3.11, installs uv, creates venv, installs
