@@ -717,3 +717,89 @@ def test_force_ingest_file_missing_from_quarantine(tmp_path):
                            return_value={'sermon_library_folder': str(tmp_path)}):
         result = app_module.force_ingest_file('manual_review', 'ghost.doc')
     assert 'not found' in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# batch_ignore_quarantine
+# ---------------------------------------------------------------------------
+
+def test_batch_ignore_removes_all_files(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    bucket = root / "too_short"
+    bucket.mkdir(parents=True)
+    for i in range(3):
+        (bucket / f"sermon_{i}.docx").write_text("x")
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.batch_ignore_quarantine('too_short')
+    assert "3" in result
+    assert list(bucket.iterdir()) == []
+
+
+def test_batch_ignore_missing_bucket(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    root.mkdir(parents=True)
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.batch_ignore_quarantine('nonexistent')
+    assert 'not found' in result.lower()
+
+
+def test_batch_ignore_empty_bucket(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    bucket = root / "too_short"
+    bucket.mkdir(parents=True)
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.batch_ignore_quarantine('too_short')
+    assert 'empty' in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# request_batch_action / execute_batch_action / cancel_batch_action
+# ---------------------------------------------------------------------------
+
+def test_request_batch_action_ignore_returns_pending_state():
+    pending, msg, col_update = app_module.request_batch_action('ignore', 'too_short', 5)
+    assert pending == {'action': 'ignore', 'reason': 'too_short', 'count': 5}
+    assert '5' in msg
+    assert col_update.get('visible') is True  # gr.update dict
+
+
+def test_request_batch_action_force_returns_pending_state():
+    pending, msg, col_update = app_module.request_batch_action('force', 'manual_review', 10)
+    assert pending == {'action': 'force', 'reason': 'manual_review', 'count': 10}
+    assert '10' in msg
+    assert col_update.get('visible') is True
+
+
+def test_request_batch_action_large_count_adds_warning():
+    pending, msg, _col = app_module.request_batch_action('force', 'too_short', 200)
+    assert 'minutes' in msg.lower() or '200' in msg
+
+
+def test_execute_batch_action_clears_pending_and_hides_panel(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    bucket = root / "too_short"
+    bucket.mkdir(parents=True)
+    (bucket / "a.docx").write_text("x")
+    pending = {'action': 'ignore', 'reason': 'too_short', 'count': 1}
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        cleared, confirm_msg, col_update, result = app_module.execute_batch_action(pending)
+    assert cleared == {'action': None, 'reason': None, 'count': 0}
+    assert confirm_msg == ""
+    assert col_update.get('visible') is False
+    assert '1' in result or 'deleted' in result.lower() or '✓' in result
+
+
+def test_execute_batch_action_with_empty_pending():
+    cleared, confirm_msg, col_update, result = app_module.execute_batch_action(
+        {'action': None, 'reason': None, 'count': 0}
+    )
+    assert cleared == {'action': None, 'reason': None, 'count': 0}
+    assert col_update.get('visible') is False
+
+
+def test_cancel_batch_action_clears_state():
+    cleared, confirm_msg, col_update, result = app_module.cancel_batch_action()
+    assert cleared == {'action': None, 'reason': None, 'count': 0}
+    assert confirm_msg == ""
+    assert col_update.get('visible') is False
+    assert result == ""

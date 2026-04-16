@@ -771,6 +771,153 @@ def get_quarantine_summary() -> str:
     return "\n".join(lines)
 
 
+def batch_ignore_quarantine(reason: str) -> str:
+    """Permanently delete every file in a quarantine bucket."""
+    root = _quarantine_root()
+    bucket = root / reason
+    if not bucket.exists():
+        return f"Bucket '{reason}' not found."
+    files = [f for f in sorted(bucket.iterdir()) if f.is_file()]
+    if not files:
+        return "Bucket is already empty."
+    removed, errors = 0, []
+    for f in files:
+        try:
+            f.unlink()
+            removed += 1
+        except Exception as e:
+            errors.append(f"{f.name}: {e}")
+            get_logger(__name__).error("Batch delete failed %s: %s", f, e)
+    label = QUARANTINE_LABELS.get(reason, reason)
+    msg = f"✓ Deleted {removed} file(s) from '{label}'."
+    if errors:
+        msg += f"\n{len(errors)} error(s): " + "; ".join(errors[:5])
+    return msg
+
+
+def batch_force_ingest_quarantine(reason: str) -> str:
+    """Copy every file in a quarantine bucket to the library and re-ingest."""
+    _log = get_logger(__name__)
+    root = _quarantine_root()
+    bucket = root / reason
+    if not bucket.exists():
+        return f"Bucket '{reason}' not found."
+    files = [f for f in sorted(bucket.iterdir()) if f.is_file()]
+    if not files:
+        return "Bucket is already empty."
+
+    settings = load_settings()
+    library = settings.get('sermon_library_folder', '').strip()
+    if not library or not Path(library).is_dir():
+        return "Sermon library folder is not set. Set it on the Manage Archive tab first."
+
+    import shutil
+    copied, copy_errors = 0, []
+    for f in files:
+        dest = Path(library) / f.name
+        if dest.exists():
+            dest = Path(library) / f"{f.stem}_recovered{f.suffix}"
+        try:
+            shutil.copy2(str(f), str(dest))
+            copied += 1
+        except Exception as e:
+            copy_errors.append(f"{f.name}: {e}")
+            _log.error("Batch copy failed %s: %s", f, e)
+
+    lines = [f"Copied {copied} file(s) to library."]
+    if copy_errors:
+        lines.append(f"{len(copy_errors)} copy error(s): " + "; ".join(copy_errors[:5]))
+    if copied == 0:
+        return "\n".join(lines)
+
+    if sys.platform == 'win32':
+        _run_subprocess([
+            'powershell', '-NonInteractive', '-Command',
+            f'Get-ChildItem -Path "{library}" | Unblock-File',
+        ])
+        lines.append("Files unblocked.")
+
+    raw = _run_subprocess([
+        sys.executable, "build/01_ingest_files.py",
+        "--source", library, "--force", "--verbose",
+    ])
+    lines.append("\n--- Ingest ---\n" + raw.strip())
+
+    raw2 = _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--incremental"])
+    lines.append("\n--- Embed ---\n" + raw2.strip())
+
+    try:
+        from app.retriever import load_retriever
+        global _retriever
+        _retriever = load_retriever(
+            db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH,
+            sermon_root=library,
+        )
+        lines.append("\nRetriever reloaded.")
+    except Exception as e:
+        lines.append(f"\nRetriever reload failed: {e}")
+
+    removed = 0
+    for f in files:
+        try:
+            if f.exists():
+                f.unlink()
+                removed += 1
+        except Exception:
+            pass
+    lines.append(f"Removed {removed} file(s) from quarantine/{reason}/.")
+    return "\n".join(lines)
+
+
+def request_batch_action(action: str, reason: str, count: int) -> tuple:
+    """Build confirmation panel content for a pending batch action.
+
+    Returns (pending_state, confirm_message, column_visible_update).
+    """
+    label = QUARANTINE_LABELS.get(reason, reason)
+    if action == 'ignore':
+        msg = (
+            f"**Delete all {count} file(s)** from *{label}*?\n\n"
+            "This permanently removes them from quarantine and **cannot be undone**."
+        )
+    else:
+        msg = f"**Force ingest all {count} file(s)** from *{label}*?"
+        if count > 100:
+            msg += (
+                f"\n\n⏳ Copying and indexing {count} files may take several minutes."
+            )
+        if reason == 'duplicates':
+            msg += (
+                "\n\n⚠️ These are duplicate files — ingesting them will add them "
+                "to the index alongside the originals."
+            )
+    return (
+        {"action": action, "reason": reason, "count": count},
+        msg,
+        gr.update(visible=True),
+    )
+
+
+def execute_batch_action(pending: dict) -> tuple:
+    """Execute the confirmed batch action, then hide the confirmation panel."""
+    action = pending.get("action")
+    reason = pending.get("reason")
+    _clear = {"action": None, "reason": None, "count": 0}
+    if not action or not reason:
+        return _clear, "", gr.update(visible=False), ""
+    result = (
+        batch_ignore_quarantine(reason)
+        if action == 'ignore'
+        else batch_force_ingest_quarantine(reason)
+    )
+    return _clear, "", gr.update(visible=False), result
+
+
+def cancel_batch_action() -> tuple:
+    """Dismiss the confirmation panel without doing anything."""
+    return {"action": None, "reason": None, "count": 0}, "", gr.update(visible=False), ""
+
+
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
@@ -819,6 +966,16 @@ CSS = """
     border-top: 1px solid #e4ddd4;
     margin: 1.25rem 0;
 }
+
+/* ── Quarantine: batch confirmation box ──────────────────────────────── */
+.confirm-box {
+    background: #fff8f0;
+    border: 1px solid #d4a574;
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    margin: 0.75rem 0;
+}
+.confirm-box p { margin: 0 0 0.75rem; }
 
 footer { display: none !important; }
 """
@@ -955,6 +1112,16 @@ def build_ui():
                 gr.HTML("<hr class='archive-divider'>")
 
                 quarantine_action_md = gr.Markdown(value="")
+                quarantine_pending = gr.State({"action": None, "reason": None, "count": 0})
+
+                # Confirmation panel — hidden until a batch button is clicked
+                with gr.Column(visible=False, elem_classes=["confirm-box"]) as confirm_col:
+                    confirm_msg_md = gr.Markdown(value="")
+                    with gr.Row():
+                        confirm_yes_btn = gr.Button("✅  Yes, proceed", variant="primary", size="sm")
+                        confirm_no_btn  = gr.Button("Cancel",           variant="secondary", size="sm")
+
+                gr.HTML("<hr class='archive-divider'>")
 
                 # One accordion per quarantine bucket, populated at render time
                 _buckets = list_quarantine()
@@ -965,6 +1132,30 @@ def build_ui():
                         f"{_label}  ({_count} file{'s' if _count != 1 else ''})",
                         open=(_reason == 'manual_review'),
                     ):
+                        # ── Batch action buttons ──────────────────────────────
+                        with gr.Row():
+                            _del_all_btn = gr.Button(
+                                f"🗑️  Delete All ({_count})",
+                                variant="secondary", size="sm",
+                            )
+                            _fi_all_btn = gr.Button(
+                                f"➕  Force Ingest All ({_count})",
+                                variant="primary", size="sm",
+                            )
+                        # Wire inline (captures loop vars via default args)
+                        _del_all_btn.click(
+                            fn=lambda r=_reason, c=_count: request_batch_action('ignore', r, c),
+                            inputs=[],
+                            outputs=[quarantine_pending, confirm_msg_md, confirm_col],
+                        )
+                        _fi_all_btn.click(
+                            fn=lambda r=_reason, c=_count: request_batch_action('force', r, c),
+                            inputs=[],
+                            outputs=[quarantine_pending, confirm_msg_md, confirm_col],
+                        )
+
+                        gr.HTML("<hr class='archive-divider'>")
+
                         if _reason == 'manual_review':
                             gr.Markdown(
                                 "💡 These `.doc` files are blocked by Windows security. "
@@ -979,7 +1170,8 @@ def build_ui():
                         if len(_files) > 200:
                             gr.Markdown(
                                 f"_Showing first 200 of {len(_files)} files. "
-                                "Unblock + Process New Files is the fastest way to handle large batches._",
+                                "Use **Force Ingest All** or **Delete All** above to act on "
+                                "the entire bucket at once._",
                                 elem_classes=["status-hint"],
                             )
 
@@ -1008,6 +1200,19 @@ def build_ui():
                                     inputs=[],
                                     outputs=[quarantine_action_md],
                                 )
+
+                # Wire the confirm / cancel buttons (outside accordion loop — shared by all buckets)
+                _confirm_outputs = [quarantine_pending, confirm_msg_md, confirm_col, quarantine_action_md]
+                confirm_yes_btn.click(
+                    fn=execute_batch_action,
+                    inputs=[quarantine_pending],
+                    outputs=_confirm_outputs,
+                )
+                confirm_no_btn.click(
+                    fn=cancel_batch_action,
+                    inputs=[],
+                    outputs=_confirm_outputs,
+                )
 
                 quarantine_refresh_btn.click(
                     fn=get_quarantine_summary,
