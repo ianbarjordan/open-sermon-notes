@@ -12,6 +12,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import gradio
+import gradio as gr
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.config import (  # noqa: E402
     AUTO_EXPAND_THRESHOLD,
@@ -245,7 +248,7 @@ def _extract_row_index(evt) -> int | None:
     return None
 
 
-def on_row_select(evt, chunks_state: list) -> str:
+def on_row_select(evt: "gradio.SelectData", chunks_state: list) -> str:
     """Fires when any cell in results_df is clicked. Opens source file for that row."""
     if evt is None:
         return ""
@@ -822,13 +825,11 @@ footer { display: none !important; }
 
 
 def build_ui():
-    import gradio as gr
-
     # Load persisted settings for default values
     _settings = load_settings()
     _saved_folder = _settings.get('sermon_library_folder', '')
 
-    with gr.Blocks(title="Sermon Note Search", theme=gr.themes.Soft(), css=CSS) as demo:
+    with gr.Blocks(title="Sermon Note Search") as demo:
 
         # ── App header ────────────────────────────────────────────────────
         gr.HTML("""
@@ -944,9 +945,8 @@ def build_ui():
 
                 with gr.Row():
                     quarantine_refresh_btn = gr.Button("🔄  Refresh", variant="secondary", scale=1)
-                    quarantine_summary_md = gr.Markdown(
-                        value=get_quarantine_summary(), scale=4
-                    )
+                    with gr.Column(scale=4):
+                        quarantine_summary_md = gr.Markdown(value=get_quarantine_summary())
 
                 gr.HTML("<hr class='archive-divider'>")
 
@@ -1148,6 +1148,8 @@ def main() -> None:
         server_port=args.port,
         share=False,
         inbrowser=True,
+        theme=gr.themes.Soft(),
+        css=CSS,
     )
 
 
