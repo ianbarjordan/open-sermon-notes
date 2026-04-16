@@ -1,5 +1,5 @@
 @echo off
 call .venv\Scripts\activate.bat
 echo Starting sermon search app...
-start "" http://127.0.0.1:7860
+echo The browser will open automatically once the app has finished loading.
 python app\app.py --port 7860

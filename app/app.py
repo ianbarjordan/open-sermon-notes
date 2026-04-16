@@ -3,9 +3,10 @@ app.py — Gradio UI for AI-Powered Sermon Note Search.
 
 Usage:
     python app/app.py --port 7860
-    python app/app.py --host 0.0.0.0 --port 7860 --share
+    python app/app.py --host 127.0.0.1 --port 7861
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -13,14 +14,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.config import (  # noqa: E402
+    AUTO_EXPAND_THRESHOLD,
     DB_PATH,
     FAISS_PATH,
     ID_MAP_PATH,
     LOW_CONFIDENCE_THRESHOLD,
     MAX_TOP_K,
     MODEL_PATH,
+    SETTINGS_PATH,
     TOP_K,
 )
+from app.logging_config import get_logger, log_dir, setup_logging  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Global retriever + LLM (loaded once at startup)
@@ -32,6 +36,35 @@ _llm = None
 _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
+# ---------------------------------------------------------------------------
+# Persistent settings (data/settings.json)
+# ---------------------------------------------------------------------------
+
+def _settings_path() -> Path:
+    return Path(_PROJECT_ROOT) / SETTINGS_PATH
+
+
+def load_settings() -> dict:
+    p = _settings_path()
+    if p.exists():
+        try:
+            with open(p, encoding='utf-8') as fh:
+                return json.load(fh)
+        except Exception:
+            pass
+    return {}
+
+
+def save_settings(settings: dict) -> None:
+    p = _settings_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(p, 'w', encoding='utf-8') as fh:
+            json.dump(settings, fh, indent=2)
+    except Exception:
+        pass
+
+
 def _load_components(
     db: str,
     faiss: str,
@@ -40,6 +73,7 @@ def _load_components(
 ) -> tuple[str, str]:
     """Load retriever and LLM; return (retriever_status, llm_status)."""
     global _retriever, _llm
+    _log = get_logger(__name__)
 
     ret_status = "Retriever: not loaded"
     llm_status = "LLM: not loaded"
@@ -50,7 +84,7 @@ def _load_components(
         ret_status = "Retriever: loaded"
     except Exception as e:
         ret_status = f"Retriever ERROR: {e}"
-        print(ret_status, file=sys.stderr)
+        _log.error("Retriever failed to load", exc_info=True)
 
     try:
         from app.llm import load_llm
@@ -58,10 +92,10 @@ def _load_components(
         llm_status = "LLM: loaded"
     except FileNotFoundError as e:
         llm_status = f"LLM: model not found — {e}"
-        print(llm_status, file=sys.stderr)
+        _log.warning("LLM model file not found: %s", e)
     except Exception as e:
         llm_status = f"LLM ERROR: {e}"
-        print(llm_status, file=sys.stderr)
+        _log.error("LLM failed to load", exc_info=True)
 
     return ret_status, llm_status
 
@@ -84,12 +118,23 @@ def handle_query(query: str, top_k: int = TOP_K):
         return ("Retriever is not available. Check startup logs.", [], "Error: retriever not loaded", [])
 
     try:
-        chunks = _retriever.search(query, top_k=int(top_k))
+        # Always fetch the full MAX_TOP_K pool so auto-expansion has candidates to draw from
+        all_chunks = _retriever.search(query, top_k=MAX_TOP_K)
     except Exception as e:
         return (f"Retrieval error: {e}", [], f"Error: {e}", [])
 
-    if not chunks:
+    if not all_chunks:
         return ("No relevant sermons found for this query.", [], "0 results", [])
+
+    # Auto-expand: always show at least top_k, plus any additional results that score
+    # above AUTO_EXPAND_THRESHOLD (≈70% match) up to MAX_TOP_K.
+    min_results = int(top_k)
+    base = all_chunks[:min_results]
+    expanded = [
+        c for c in all_chunks[min_results:]
+        if c.get('score', 0) >= AUTO_EXPAND_THRESHOLD
+    ]
+    chunks = base + expanded
 
     # Build answer via LLM (or fallback if LLM not loaded)
     if _llm is not None:
@@ -134,7 +179,14 @@ def handle_query(query: str, top_k: int = TOP_K):
             "Results shown are the closest matches available."
         )
     else:
-        status = f"{len(chunks)} result(s) returned"
+        n = len(chunks)
+        if n > min_results and expanded:
+            status = (
+                f"{n} result(s) — {len(expanded)} additional high-confidence match(es) "
+                f"included automatically"
+            )
+        else:
+            status = f"{n} result(s) returned"
 
     return answer, rows, status, chunks
 
@@ -219,83 +271,332 @@ def open_file(result_num: int, chunks_state: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Log folder handler
+# ---------------------------------------------------------------------------
+
+def open_log_folder() -> str:
+    """Open the logs/ directory in the system file explorer."""
+    logs = log_dir()
+    logs.mkdir(parents=True, exist_ok=True)
+    try:
+        if sys.platform == 'win32':
+            os.startfile(str(logs))
+        elif sys.platform == 'darwin':
+            subprocess.run(['open', str(logs)], check=True)
+        else:
+            subprocess.run(['xdg-open', str(logs)], check=True)
+        return f"Opened: {logs}"
+    except Exception as e:
+        return f"Could not open log folder: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Run summary: parse ingest output + friendly errors
+# ---------------------------------------------------------------------------
+
+# (trigger strings, user-facing message)
+_ERROR_PATTERNS = [
+    (
+        ['Word blocked', 'trust', '-2146821993', 'detected a problem'],
+        "Word security blocked some files. "
+        "Use the **Unblock Sermon Library** button below, then click "
+        "**Process New Files** again.",
+    ),
+    (
+        ['Permission denied', 'PermissionError'],
+        "Could not access some files — they may be open in another program. "
+        "Close any open Word or PowerPoint windows and try again.",
+    ),
+    (
+        ['ModuleNotFoundError', 'ImportError', 'No module named'],
+        "A required package is missing. Re-run setup.bat to repair the installation.",
+    ),
+    (
+        ['antiword: not found', "'antiword'"],
+        "antiword is not installed. On Linux/WSL run: `sudo apt-get install antiword`",
+    ),
+]
+
+# Quarantine reasons that count as "skipped" (not errors, not accepted)
+_SKIP_OUTCOMES = {
+    'too_short', 'non_faith', 'filename_flagged', 'format_pub',
+    'worship_slides', 'sparse_pptx', 'duplicates', 'skipped', 'skipped_exists',
+}
+
+
+def _parse_ingest_counts(raw_log: str) -> dict[str, int]:
+    """Extract outcome counts from the '--- Ingest Summary ---' block in raw log."""
+    import re
+    counts: dict[str, int] = {}
+    in_summary = False
+    for line in raw_log.splitlines():
+        if '--- Ingest Summary ---' in line:
+            in_summary = True
+            continue
+        if in_summary:
+            m = re.match(r'\s+(\w+)\s+(\d+)', line)
+            if m and m.group(1) != 'TOTAL':
+                counts[m.group(1)] = int(m.group(2))
+    return counts
+
+
+def _quarantine_filenames(quarantine_root: str, reason: str, limit: int = 10) -> list[str]:
+    """Return up to `limit` filenames from a quarantine sub-folder."""
+    qdir = Path(_PROJECT_ROOT) / quarantine_root / reason
+    if not qdir.exists():
+        return []
+    names = sorted(p.name for p in qdir.iterdir() if p.is_file())
+    return names[:limit]
+
+
+def _build_run_summary(
+    raw_log: str,
+    quarantine_root: str = 'raw/quarantine',
+    operation: str = 'Processing',
+) -> str:
+    """Build a human-readable Markdown summary from an ingest+embed run."""
+    lines: list[str] = []
+
+    # --- Error patterns take priority ---
+    _error_matched = False
+    for patterns, message in _ERROR_PATTERNS:
+        if any(p in raw_log for p in patterns):
+            lines.append(f"⚠️  {message}")
+            _error_matched = True
+            break
+    if not _error_matched and '[exit code:' in raw_log:
+        lines.append(
+            "⚠️  Something went wrong. "
+            "See the technical log below or check **logs/app.log** for details."
+        )
+
+    # --- Ingest counts ---
+    counts = _parse_ingest_counts(raw_log)
+    if counts:
+        accepted = counts.get('accepted', 0)
+        manual_review = counts.get('manual_review', 0)
+        skipped = sum(counts.get(r, 0) for r in _SKIP_OUTCOMES)
+
+        parts: list[str] = []
+        if accepted > 0:
+            noun = 'sermon' if accepted == 1 else 'sermons'
+            parts.append(f"✅  **{accepted}** {noun} added to the archive")
+        elif not lines:
+            parts.append("ℹ️  No new sermons found.")
+
+        if manual_review > 0:
+            noun = 'file' if manual_review == 1 else 'files'
+            blocked = _quarantine_filenames(quarantine_root, 'manual_review')
+            block_list = '\n'.join(f"  • {f}" for f in blocked)
+            total_blocked = counts.get('manual_review', 0)
+            overflow = f"\n  *(…and {total_blocked - len(blocked)} more)*" if total_blocked > len(blocked) else ''
+            parts.append(
+                f"⚠️  **{manual_review}** {noun} need attention "
+                f"(Word security blocked):\n{block_list}{overflow}\n\n"
+                "Use **Unblock Sermon Library** below, then click **Process New Files** again."
+            )
+
+        if skipped > 0:
+            noun = 'file' if skipped == 1 else 'files'
+            parts.append(
+                f"ℹ️  **{skipped}** {noun} skipped "
+                "(too short, non-faith content, duplicates, etc.)"
+            )
+
+        lines.extend(parts)
+
+    if not lines:
+        lines.append(f"✅  {operation} complete.")
+
+    return '\n\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Unblock handler (Windows only)
+# ---------------------------------------------------------------------------
+
+def unblock_library(folder: str) -> tuple[str, str]:
+    """Run PowerShell Unblock-File on all files in the sermon library folder.
+
+    Returns (summary, raw_log). Only meaningful on Windows; shows a clear
+    message on other platforms.
+    """
+    if not folder or not folder.strip():
+        return "Please enter your sermon library folder path first.", ""
+    folder = folder.strip()
+    if not Path(folder).is_dir():
+        return f"Folder not found: {folder}", ""
+
+    if sys.platform != 'win32':
+        return "ℹ️  Unblock-File is a Windows-only operation.", ""
+
+    raw = f"=== Unblocking files in: {folder} ===\n\n"
+    cmd = [
+        'powershell', '-NoProfile', '-NonInteractive', '-Command',
+        f'Get-ChildItem -Path "{folder}" -Recurse -File | Unblock-File -Confirm:$false; '
+        f'Write-Output "Done."',
+    ]
+    _log = get_logger(__name__)
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=_PROJECT_ROOT
+        )
+        raw += result.stdout
+        if result.stderr:
+            raw += '\n[stderr]\n' + result.stderr
+        if result.returncode != 0:
+            raw += f'\n[exit code: {result.returncode}]'
+            _log.error('Unblock-File exited %d\n%s', result.returncode, raw)
+            summary = '⚠️  Unblock command finished with errors. See the technical log.'
+        else:
+            summary = (
+                '✅  Files unblocked successfully.\n\n'
+                'Click **Process New Files** to retry ingesting the blocked sermons.'
+            )
+    except Exception as e:
+        _log.error('Unblock-File failed', exc_info=True)
+        raw += f'Error: {e}'
+        summary = f'⚠️  Could not run PowerShell: {e}'
+
+    return summary, raw
+
+
+# ---------------------------------------------------------------------------
+# Folder picker (Windows: tkinter subprocess; other: no-op)
+# ---------------------------------------------------------------------------
+
+def browse_folder() -> str:
+    """Open a native folder picker dialog and return the selected path.
+
+    Runs tkinter in a subprocess to avoid GUI/thread conflicts with Gradio.
+    Returns '' on cancel or if tkinter is unavailable.
+    """
+    if sys.platform != 'win32':
+        return ''
+    try:
+        result = subprocess.run(
+            [
+                sys.executable, '-c',
+                'import tkinter as tk; from tkinter import filedialog; '
+                'root = tk.Tk(); root.withdraw(); root.wm_attributes("-topmost", 1); '
+                'path = filedialog.askdirectory(title="Select your sermon library folder"); '
+                'print(path, end="")',
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ''
+
+
+# ---------------------------------------------------------------------------
 # Manage Archive handlers
 # ---------------------------------------------------------------------------
 
 def _run_subprocess(cmd: list[str]) -> str:
     """Run a subprocess, capture stdout+stderr, return combined output."""
+    _log = get_logger(__name__)
     try:
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             cwd=_PROJECT_ROOT,
+            env=env,
         )
         out = result.stdout
         if result.stderr:
             out += "\n[stderr]\n" + result.stderr
         if result.returncode != 0:
             out += f"\n[exit code: {result.returncode}]"
+            _log.error("Subprocess exited %d: %s\n%s", result.returncode, cmd, out)
         return out
     except Exception as e:
+        _log.error("Subprocess launch failed: %s", cmd, exc_info=True)
         return f"Subprocess error: {e}"
 
 
-def process_new_files(folder: str) -> str:
-    """Ingest + incremental embed for a new folder of sermon files."""
+def _validate_and_persist_folder(folder: str) -> tuple[str, str] | None:
+    """Validate folder path and persist it. Returns (None, None) on success,
+    or (summary, raw_log) error tuple on failure."""
     if not folder or not folder.strip():
-        return "Please enter a folder path."
+        msg = "Please enter your sermon library folder path."
+        return msg, ""
+    folder = folder.strip()
+    if not Path(folder).is_dir():
+        msg = (
+            f"Folder not found: {folder}\n\n"
+            "Check that the path is correct and the drive is connected, then try again."
+        )
+        return msg, ""
+    settings = load_settings()
+    settings['sermon_library_folder'] = folder
+    save_settings(settings)
+    return None, None
 
-    log = f"=== Processing new files from: {folder} ===\n\n"
 
-    log += "--- Step 1: Ingest files ---\n"
-    log += _run_subprocess([sys.executable, "build/01_ingest_files.py", "--source", folder, "--verbose"])
-    log += "\n\n--- Step 2: Incremental embed ---\n"
-    log += _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--incremental"])
+def process_new_files(folder: str) -> tuple[str, str]:
+    """Ingest + incremental embed. Returns (summary, raw_log)."""
+    err_summary, err_log = _validate_and_persist_folder(folder)
+    if err_summary is not None:
+        return err_summary, err_log
 
-    # Reload retriever in-place
-    log += "\n\n--- Reloading retriever ---\n"
+    folder = folder.strip()
+    raw = f"=== Processing new files from: {folder} ===\n\n"
+    raw += "--- Step 1: Ingest files ---\n"
+    raw += _run_subprocess([sys.executable, "build/01_ingest_files.py", "--source", folder, "--verbose"])
+    raw += "\n\n--- Step 2: Incremental embed ---\n"
+    raw += _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--incremental"])
+
+    raw += "\n\n--- Reloading retriever ---\n"
     try:
         from app.retriever import load_retriever
         global _retriever
         _retriever = load_retriever(
             db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH
         )
-        log += "Retriever reloaded successfully.\n"
+        raw += "Retriever reloaded successfully.\n"
     except Exception as e:
-        log += f"Retriever reload failed: {e}\n"
+        raw += f"Retriever reload failed: {e}\n"
+        get_logger(__name__).error("Retriever reload failed", exc_info=True)
 
-    return log
+    summary = _build_run_summary(raw, operation='Processing')
+    return summary, raw
 
 
-def full_rebuild(folder: str) -> str:
-    """Full ingest (force) + full embed rebuild."""
-    if not folder or not folder.strip():
-        return "Please enter a folder path."
+def full_rebuild(folder: str) -> tuple[str, str]:
+    """Full ingest (force) + full embed rebuild. Returns (summary, raw_log)."""
+    err_summary, err_log = _validate_and_persist_folder(folder)
+    if err_summary is not None:
+        return err_summary, err_log
 
-    log = f"=== Full rebuild from: {folder} ===\n\n"
-
-    log += "--- Step 1: Ingest files (force) ---\n"
-    log += _run_subprocess([
+    folder = folder.strip()
+    raw = f"=== Full rebuild from: {folder} ===\n\n"
+    raw += "--- Step 1: Ingest files (force) ---\n"
+    raw += _run_subprocess([
         sys.executable, "build/01_ingest_files.py",
         "--source", folder, "--force", "--verbose",
     ])
-    log += "\n\n--- Step 2: Full embed rebuild ---\n"
-    log += _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--force"])
+    raw += "\n\n--- Step 2: Full embed rebuild ---\n"
+    raw += _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--force"])
 
-    # Reload retriever in-place
-    log += "\n\n--- Reloading retriever ---\n"
+    raw += "\n\n--- Reloading retriever ---\n"
     try:
         from app.retriever import load_retriever
         global _retriever
         _retriever = load_retriever(
             db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH
         )
-        log += "Retriever reloaded successfully.\n"
+        raw += "Retriever reloaded successfully.\n"
     except Exception as e:
-        log += f"Retriever reload failed: {e}\n"
+        raw += f"Retriever reload failed: {e}\n"
+        get_logger(__name__).error("Retriever reload failed", exc_info=True)
 
-    return log
+    summary = _build_run_summary(raw, operation='Rebuild')
+    return summary, raw
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +604,50 @@ def full_rebuild(folder: str) -> str:
 # ---------------------------------------------------------------------------
 
 CSS = """
-#search-col { max-width: 860px; margin: auto; }
-.answer-box { background: #f8f8f5; border-radius: 8px; padding: 1rem; }
-.results-table { font-size: 0.88rem; }
+/* ── Overall container ───────────────────────────────────────────────── */
+.gradio-container {
+    font-family: Georgia, 'Times New Roman', serif;
+    background-color: #f9f7f4;
+}
+
+/* ── App header ──────────────────────────────────────────────────────── */
+#app-header {
+    text-align: center;
+    padding: 0.75rem 0 1.25rem;
+    border-bottom: 1px solid #e4ddd4;
+    margin-bottom: 1rem;
+}
+
+/* ── Search: answer box ──────────────────────────────────────────────── */
+.answer-box {
+    background: #ffffff;
+    border-left: 4px solid #8b5e3c;
+    border-radius: 0 6px 6px 0;
+    padding: 1rem 1.5rem;
+    line-height: 1.8;
+    color: #2a1f17;
+    min-height: 2.5rem;
+}
+.answer-box p { margin: 0; }
+
+/* ── Search: results table ───────────────────────────────────────────── */
+.passages-table { font-size: 0.85rem; }
+.passages-table table th {
+    background-color: #f0ebe3 !important;
+    color: #3b2a1e !important;
+    font-weight: 600;
+}
+
+/* ── Shared hint / status text ───────────────────────────────────────── */
+.status-hint { color: #9a8070; font-size: 0.82rem; }
+
+/* ── Archive: section dividers ───────────────────────────────────────── */
+.archive-divider {
+    border: none;
+    border-top: 1px solid #e4ddd4;
+    margin: 1.25rem 0;
+}
+
 footer { display: none !important; }
 """
 
@@ -313,66 +655,87 @@ footer { display: none !important; }
 def build_ui():
     import gradio as gr
 
+    # Load persisted settings for default values
+    _settings = load_settings()
+    _saved_folder = _settings.get('sermon_library_folder', '')
+
     with gr.Blocks(title="Sermon Note Search", theme=gr.themes.Soft(), css=CSS) as demo:
-        gr.Markdown("# Sermon Note Search")
+
+        # ── App header ────────────────────────────────────────────────────
+        gr.HTML("""
+            <div id="app-header">
+                <h1 style="font-family:Georgia,serif;font-size:1.9rem;font-weight:normal;
+                           color:#3b2a1e;letter-spacing:0.02em;margin:0 0 0.3rem">
+                    Sermon Note Search
+                </h1>
+                <p style="color:#9a8070;font-size:0.88rem;margin:0">
+                    Private &amp; offline — your notes never leave this computer
+                </p>
+            </div>
+        """)
 
         with gr.Tabs():
 
             # ----------------------------------------------------------------
             # Search tab
             # ----------------------------------------------------------------
-            with gr.Tab("Search"):
+            with gr.Tab("🔍  Search"):
                 chunks_state = gr.State([])
 
-                with gr.Row(elem_id="search-col"):
-                    query_box = gr.Textbox(
-                        label="Your question",
-                        lines=1,
-                        max_lines=6,
-                        placeholder="Ask about a topic, scripture, or season…",
-                        scale=4,
-                    )
+                # Full-width query box
+                query_box = gr.Textbox(
+                    label="",
+                    show_label=False,
+                    lines=2,
+                    max_lines=6,
+                    placeholder=(
+                        "Ask about a topic, scripture, or season…\n"
+                        "e.g. 'forgiveness in the Psalms'  ·  'Advent 2012'  ·  'prodigal son'"
+                    ),
+                )
+
+                # Search button + Min. results slider on the same row
+                with gr.Row():
+                    search_btn = gr.Button("Search", variant="primary", scale=3)
                     top_k_slider = gr.Slider(
                         minimum=1,
                         maximum=MAX_TOP_K,
                         value=TOP_K,
                         step=1,
-                        label="Results",
+                        label="Min. results",
                         scale=1,
                     )
 
-                search_btn = gr.Button("Search", variant="primary")
-
+                # Answer — shows a soft hint before the first search
                 answer_md = gr.Markdown(
-                    label="Answer",
-                    value="",
+                    value="_Enter a topic, scripture, or sermon theme above to search your notes._",
                     elem_classes=["answer-box"],
                 )
 
-                gr.HTML("<hr style='border:none;border-top:1px solid #ddd;margin:0.5rem 0'>")
+                gr.HTML("<hr class='archive-divider'>")
 
                 results_df = gr.Dataframe(
-                    headers=["#", "Title", "Scripture", "Date", "Snippet", "Match %", "Source File"],
+                    headers=["#", "Title", "Scripture", "Date", "Excerpt", "Match %", "Source File"],
                     datatype=["number", "str", "str", "str", "str", "str", "str"],
-                    label="Source Chunks  (click a row to open the file)",
+                    label="Matching Passages  —  click a row to open the source file",
                     wrap=True,
-                    elem_classes=["results-table"],
-                    row_count=(15, "fixed"),
+                    elem_classes=["passages-table"],
+                    row_count=(MAX_TOP_K, "fixed"),
                 )
 
                 with gr.Row():
                     result_num = gr.Number(
                         value=1, minimum=1, maximum=MAX_TOP_K, step=1,
-                        label="Result #", scale=1,
+                        label="Row", scale=1,
                     )
-                    open_btn = gr.Button("Open File", scale=2)
+                    open_btn = gr.Button("📖  Open File", scale=2)
                     open_status = gr.Textbox(
                         label="", interactive=False, show_label=False,
-                        placeholder="Click a row or enter Result # and click Open File…",
+                        placeholder="Click a row in the table, or enter a row number and click Open File",
                         scale=4,
                     )
 
-                status_md = gr.Markdown(value="")
+                status_md = gr.Markdown(value="", elem_classes=["status-hint"])
 
                 # Search events
                 search_inputs = [query_box, top_k_slider]
@@ -382,38 +745,102 @@ def build_ui():
 
                 # Row-click file open (best-effort — depends on Gradio build)
                 results_df.select(fn=on_row_select, inputs=[chunks_state], outputs=[open_status])
-                # Reliable fallback: Result # number input + button
+                # Reliable fallback: Row number input + button
                 open_btn.click(fn=open_file, inputs=[result_num, chunks_state], outputs=[open_status])
 
             # ----------------------------------------------------------------
             # Manage Archive tab
             # ----------------------------------------------------------------
-            with gr.Tab("Manage Archive"):
-                gr.Markdown(
-                    "### Add or rebuild the sermon archive\n"
-                    "Enter the path to a folder containing new sermon files, "
-                    "then choose an action."
-                )
+            with gr.Tab("📁  Manage Archive"):
 
-                folder_box = gr.Textbox(
-                    label="New sermon files folder",
-                    placeholder=r"e.g. C:\Sermons\2025  or  ./new_sermons",
-                    lines=1,
+                # ── Section: Library folder ───────────────────────────────
+                gr.HTML("""
+                    <h3 style="font-family:Georgia,serif;font-weight:normal;
+                               color:#3b2a1e;margin:0.5rem 0 0.4rem">
+                        Sermon Library Folder
+                    </h3>
+                """)
+                gr.Markdown(
+                    "Set this to the folder where all your sermon files live. "
+                    "Add new files there first, then click **Process New Files** to index them.",
+                    elem_classes=["status-hint"],
                 )
 
                 with gr.Row():
-                    process_btn = gr.Button("➕ Process New Files", variant="primary")
-                    rebuild_btn = gr.Button("🔄 Full Rebuild", variant="secondary")
+                    folder_box = gr.Textbox(
+                        label="",
+                        show_label=False,
+                        placeholder=r"e.g. C:\Sermons  or  E:\Ministry\Sermons",
+                        value=_saved_folder,
+                        lines=1,
+                        scale=5,
+                    )
+                    if sys.platform == 'win32':
+                        browse_btn = gr.Button("📁  Browse…", scale=1)
 
-                archive_log = gr.Textbox(
-                    label="Output log",
-                    interactive=False,
-                    lines=12,
-                    max_lines=20,
+                # ── Section: Update index ─────────────────────────────────
+                gr.HTML("<hr class='archive-divider'>")
+                gr.HTML("""
+                    <h3 style="font-family:Georgia,serif;font-weight:normal;
+                               color:#3b2a1e;margin:0 0 0.4rem">
+                        Update Search Index
+                    </h3>
+                """)
+                gr.Markdown(
+                    "_Use **Process New Files** for day-to-day additions. "
+                    "**Full Rebuild** only if search results seem wrong or incomplete._",
+                    elem_classes=["status-hint"],
                 )
 
-                process_btn.click(fn=process_new_files, inputs=[folder_box], outputs=[archive_log])
-                rebuild_btn.click(fn=full_rebuild, inputs=[folder_box], outputs=[archive_log])
+                with gr.Row():
+                    process_btn = gr.Button("➕  Process New Files", variant="primary")
+                    rebuild_btn = gr.Button("🔄  Full Rebuild", variant="secondary")
+
+                archive_summary = gr.Markdown(value="")
+
+                with gr.Accordion("Technical log", open=False):
+                    archive_log = gr.Textbox(
+                        label="",
+                        show_label=False,
+                        interactive=False,
+                        lines=12,
+                        max_lines=20,
+                    )
+
+                # ── Section: File security ────────────────────────────────
+                gr.HTML("<hr class='archive-divider'>")
+                gr.HTML("""
+                    <h3 style="font-family:Georgia,serif;font-weight:normal;
+                               color:#3b2a1e;margin:0 0 0.4rem">
+                        File Security
+                    </h3>
+                """)
+                gr.Markdown(
+                    "If Word is blocking `.doc` files, click **Unblock Sermon Library** "
+                    "to remove Windows' security flag from every file in your library. "
+                    "*Only use this on folders you fully trust.*",
+                    elem_classes=["status-hint"],
+                )
+                unblock_btn = gr.Button("🔓  Unblock Sermon Library", variant="secondary")
+
+                # ── Section: Diagnostics ──────────────────────────────────
+                gr.HTML("<hr class='archive-divider'>")
+                with gr.Row():
+                    log_btn = gr.Button("📂  Open Log Folder", variant="secondary")
+                    log_status = gr.Textbox(
+                        label="", interactive=False, show_label=False,
+                        placeholder="Application logs are saved to the logs/ folder",
+                        scale=4,
+                    )
+
+                # Event wiring (unchanged)
+                archive_outputs = [archive_summary, archive_log]
+                process_btn.click(fn=process_new_files, inputs=[folder_box], outputs=archive_outputs)
+                rebuild_btn.click(fn=full_rebuild, inputs=[folder_box], outputs=archive_outputs)
+                unblock_btn.click(fn=unblock_library, inputs=[folder_box], outputs=archive_outputs)
+                log_btn.click(fn=open_log_folder, inputs=[], outputs=[log_status])
+                if sys.platform == 'win32':
+                    browse_btn.click(fn=browse_folder, inputs=[], outputs=[folder_box])
 
     return demo
 
@@ -424,9 +851,9 @@ def build_ui():
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description='Gradio UI for AI-Powered Sermon Note Search.')
-    p.add_argument('--host',  metavar='STR', default='127.0.0.1')
+    p.add_argument('--host',  metavar='STR', default='127.0.0.1',
+                   help='Bind address (default: 127.0.0.1 — local only)')
     p.add_argument('--port',  metavar='INT', type=int, default=7860)
-    p.add_argument('--share', action='store_true', help='Create a public Gradio share link')
     p.add_argument('--db',    metavar='PATH', default=DB_PATH)
     p.add_argument('--faiss', metavar='PATH', default=FAISS_PATH)
     p.add_argument('--idmap', metavar='PATH', default=ID_MAP_PATH)
@@ -435,6 +862,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    setup_logging()
     parser = build_parser()
     args = parser.parse_args()
 
@@ -449,10 +877,14 @@ def main() -> None:
     print(llm_status)
 
     demo = build_ui()
+    # inbrowser=True opens the browser only after Gradio's server is ready,
+    # avoiding the "Site Not Found" error on slow machines.
+    # share=False (default) keeps the app strictly local — no public Gradio tunnel.
     demo.launch(
         server_name=args.host,
         server_port=args.port,
-        share=args.share,
+        share=False,
+        inbrowser=True,
     )
 
 

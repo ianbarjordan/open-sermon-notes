@@ -20,13 +20,16 @@ USE_MMAP            = True
 # ---------------------------------------------------------------------------
 # Retrieval
 # ---------------------------------------------------------------------------
-TOP_K               = 5        # Default number of chunks returned to the LLM
-MAX_TOP_K           = 15       # Maximum allowed result count (slider upper bound)
+TOP_K               = 5        # Default (minimum) number of chunks shown
+MAX_TOP_K           = 50       # Slider ceiling — user can request up to this many results
 RRF_K               = 60       # Reciprocal Rank Fusion constant
 NPROBE              = 64       # FAISS IVF probe count (higher = slower but more accurate)
 CONFIDENCE_THRESHOLD = 0.005   # Minimum RRF score to include a result (RRF max ~0.033 with K=60)
 LOW_CONFIDENCE_THRESHOLD = 0.018  # Below this, warn user results may not be relevant
                                    # 0.018 ≈ requires presence in both dense+sparse lists
+AUTO_EXPAND_THRESHOLD = 0.023  # Results above this are added even if beyond the slider value
+                                # 0.023 ≈ 70% of RRF max — requires strong presence in
+                                # both dense and sparse lists
 
 # ---------------------------------------------------------------------------
 # Chunking
@@ -41,3 +44,4 @@ DB_PATH             = "data/sermons.db"
 FAISS_PATH          = "data/sermons.faiss"
 ID_MAP_PATH         = "data/id_map.json"
 DOCUMENTS_DIR       = "data/documents"
+SETTINGS_PATH       = "data/settings.json"
