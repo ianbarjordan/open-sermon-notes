@@ -829,7 +829,11 @@ def build_ui():
     _settings = load_settings()
     _saved_folder = _settings.get('sermon_library_folder', '')
 
-    with gr.Blocks(title="Sermon Note Search", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="Sermon Note Search") as demo:
+
+        # Inject CSS directly — avoids Gradio version inconsistencies with
+        # the theme/css kwargs on Blocks() and launch()
+        gr.HTML(f"<style>{CSS}</style>")
 
         # ── App header ────────────────────────────────────────────────────
         gr.HTML("""
@@ -1148,7 +1152,6 @@ def main() -> None:
         server_port=args.port,
         share=False,
         inbrowser=True,
-        css=CSS,
     )
 
 
