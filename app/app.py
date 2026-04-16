@@ -497,11 +497,15 @@ def _run_subprocess(cmd: list[str]) -> str:
     """Run a subprocess, capture stdout+stderr, return combined output."""
     _log = get_logger(__name__)
     try:
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             cwd=_PROJECT_ROOT,
+            env=env,
         )
         out = result.stdout
         if result.stderr:
