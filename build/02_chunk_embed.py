@@ -42,6 +42,34 @@ def load_documents(docs_dir: str) -> list[dict]:
     return docs
 
 
+def load_documents_from_db(db_path: str) -> list[dict]:
+    """Load all documents from the SQLite documents table.
+
+    Used when data/documents/ JSON files are absent — e.g. when running
+    from a pre-built search bundle that ships without the intermediate JSON
+    staging files.  Returns the same dict shape as load_documents().
+    """
+    if not Path(db_path).exists():
+        return []
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT doc_id, sha256, source_file, title, scripture_ref,
+                   date, format, word_count, text
+            FROM documents
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # documents table doesn't exist yet (fresh DB)
+        return []
+    finally:
+        conn.close()
+    cols = ['doc_id', 'sha256', 'source_file', 'title',
+            'scripture_ref', 'date', 'format', 'word_count', 'text']
+    return [dict(zip(cols, row)) for row in rows]
+
+
 # ---------------------------------------------------------------------------
 # SQLite setup
 # ---------------------------------------------------------------------------
@@ -383,7 +411,10 @@ def main() -> None:
     args = parser.parse_args()
 
     docs = load_documents(args.docs)
-    print(f"Loaded {len(docs)} documents from {args.docs!r}")
+    if not docs:
+        print(f"No JSON docs found in {args.docs!r} — falling back to documents table in {args.db!r}")
+        docs = load_documents_from_db(args.db)
+    print(f"Loaded {len(docs)} documents")
 
     if args.dry_run:
         print("DRY RUN — counting chunks only, no index written")
@@ -439,6 +470,14 @@ def main() -> None:
             
             print(f"Already indexed: {len(db_registry)} docs.")
             print(f"New/Updated docs: {len(new_docs)} ({len(stale_doc_ids)} modified)")
+
+            if stale_doc_ids:
+                print(
+                    f"NOTE: {len(stale_doc_ids)} modified doc(s) detected. "
+                    "Their SQLite chunks will be replaced, but orphaned FAISS vectors "
+                    "remain until a Full Rebuild is run. Search accuracy is unaffected "
+                    "for new queries; run Full Rebuild to fully remove stale vectors."
+                )
 
             if not new_docs:
                 print("Index is already up to date. Nothing to add.")

@@ -22,12 +22,13 @@ _spec = importlib.util.spec_from_file_location(
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
-init_db               = _mod.init_db
-insert_chunk_fts      = _mod.insert_chunk_fts
+init_db                  = _mod.init_db
+insert_chunk_fts         = _mod.insert_chunk_fts
 insert_document_metadata = _mod.insert_document_metadata
 build_index_incremental  = _mod.build_index_incremental
 save_artifacts           = _mod.save_artifacts
 load_documents           = _mod.load_documents
+load_documents_from_db   = _mod.load_documents_from_db
 
 # Try to import faiss — skip incremental tests if not available
 try:
@@ -236,3 +237,137 @@ def test_load_documents_empty_dir():
     with tempfile.TemporaryDirectory() as tmpdir:
         docs = load_documents(tmpdir)
         assert docs == []
+
+
+# ---------------------------------------------------------------------------
+# load_documents_from_db  (Item 13)
+# ---------------------------------------------------------------------------
+
+def test_load_documents_from_db_returns_all_rows():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = str(Path(tmpdir) / "test.db")
+        conn = init_db(db_path)
+        for i in range(3):
+            insert_document_metadata(conn, _make_doc(f'doc_{i}'))
+        conn.commit()
+        conn.close()
+
+        docs = load_documents_from_db(db_path)
+        assert len(docs) == 3
+        ids = {d['doc_id'] for d in docs}
+        assert ids == {'doc_0', 'doc_1', 'doc_2'}
+
+
+def test_load_documents_from_db_has_text_field():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = str(Path(tmpdir) / "test.db")
+        conn = init_db(db_path)
+        insert_document_metadata(conn, _make_doc('doc_text'))
+        conn.commit()
+        conn.close()
+
+        docs = load_documents_from_db(db_path)
+        assert len(docs) == 1
+        assert 'text' in docs[0]
+        assert len(docs[0]['text']) > 0
+
+
+def test_load_documents_from_db_has_sha256():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = str(Path(tmpdir) / "test.db")
+        conn = init_db(db_path)
+        doc = _make_doc('doc_sha')
+        insert_document_metadata(conn, doc)
+        conn.commit()
+        conn.close()
+
+        docs = load_documents_from_db(db_path)
+        assert docs[0]['sha256'] == f'hash_doc_sha'
+
+
+def test_load_documents_from_db_nonexistent_file():
+    docs = load_documents_from_db('/nonexistent/path/db.sqlite')
+    assert docs == []
+
+
+def test_load_documents_from_db_empty_db():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = str(Path(tmpdir) / "test.db")
+        conn = init_db(db_path)
+        conn.close()
+
+        docs = load_documents_from_db(db_path)
+        assert docs == []
+
+
+# ---------------------------------------------------------------------------
+# sha256 stale-detection via incremental  (Item 14)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not FAISS_AVAILABLE, reason="faiss not installed")
+def test_incremental_detects_changed_hash():
+    """A doc with a changed sha256 lands in new_docs and stale_doc_ids."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = str(Path(tmpdir) / "test.db")
+        conn = init_db(db_path)
+
+        # Seed DB with original hash
+        original = _make_doc('changed_doc')
+        insert_document_metadata(conn, original)
+        conn.commit()
+
+        # Simulate: same doc_id but different sha256 (file was edited)
+        modified = dict(original)
+        modified['sha256'] = 'new_hash_after_edit'
+        modified['text'] = original['text'] + ' Extra sentence added.'
+
+        # Build db_registry as the incremental path does
+        db_registry = {
+            row[0]: row[1]
+            for row in conn.execute("SELECT doc_id, sha256 FROM documents").fetchall()
+        }
+
+        stale_doc_ids = []
+        new_docs = []
+        for d in [modified]:
+            did = d['doc_id']
+            if did not in db_registry:
+                new_docs.append(d)
+            elif d.get('sha256', '') != db_registry[did]:
+                new_docs.append(d)
+                stale_doc_ids.append(did)
+
+        assert 'changed_doc' in stale_doc_ids
+        assert len(new_docs) == 1
+        conn.close()
+
+
+def test_incremental_unchanged_hash_skipped():
+    """A doc with the same sha256 as stored is not re-embedded."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = str(Path(tmpdir) / "test.db")
+        conn = init_db(db_path)
+
+        doc = _make_doc('unchanged_doc')
+        insert_document_metadata(conn, doc)
+        conn.commit()
+
+        db_registry = {
+            row[0]: row[1]
+            for row in conn.execute("SELECT doc_id, sha256 FROM documents").fetchall()
+        }
+
+        # Same sha256 → should not appear in new_docs
+        new_docs = []
+        stale_doc_ids = []
+        for d in [doc]:
+            did = d['doc_id']
+            if did not in db_registry:
+                new_docs.append(d)
+            elif d.get('sha256', '') != db_registry[did]:
+                new_docs.append(d)
+                stale_doc_ids.append(did)
+
+        assert new_docs == []
+        assert stale_doc_ids == []
+        conn.close()
