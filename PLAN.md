@@ -1,8 +1,8 @@
 # Delivery Plan: open-sermon-notes
 
 Pre-packaging refinement tasks, ordered by priority.
-Last updated: 2026-04-15
-Next session: start with item 11 (GUI analysis and redesign)
+Last updated: 2026-04-16
+Next session: start with item 17 (PyInstaller packaging)
 
 ---
 
@@ -61,7 +61,7 @@ Next session: start with item 11 (GUI analysis and redesign)
 
 ## Tier 4 — Portability foundations (required before packaging)
 
-### 12. Relative path storage + SERMON_ROOT  (`app/config.py`, `app/retriever.py`, `build/01_ingest_files.py`)
+### 12. Relative path storage + SERMON_ROOT  ✅
 - Add `SERMON_ROOT` to `app/config.py` (default: `""`, overridable via env var
   `SERMON_NOTES_ROOT` or the persistent `data/settings.json`)
 - In `01_ingest_files.py`, store `source_file` as a path **relative to `--source`** root
@@ -71,7 +71,7 @@ Next session: start with item 11 (GUI analysis and redesign)
 - Update `on_row_select()` and `open_file()` in `app/app.py` to use the resolved path
 - Required for the shipping bundle to work on a machine other than the developer's
 
-### 13. DB consolidation — store full text in SQLite  (`build/01_ingest_files.py`, `build/02_chunk_embed.py`)
+### 13. DB consolidation — store full text in SQLite  ✅
 - Add a `documents` table to `sermons.db`:
   `(doc_id TEXT PRIMARY KEY, source_file TEXT, title TEXT, scripture_ref TEXT, date TEXT,
    format TEXT, word_count INT, content_hash TEXT, full_text TEXT)`
@@ -80,7 +80,7 @@ Next session: start with item 11 (GUI analysis and redesign)
 - In `02_chunk_embed.py`, read from the `documents` table when JSON files are absent
 - Allows shipping a "Search Bundle" (FAISS + DB) without 14k individual JSON files
 
-### 14. SHA-256 stale-content detection  (`build/02_chunk_embed.py`)
+### 14. SHA-256 stale-content detection  ✅
 - During `--incremental`, compare current file `content_hash` (from `documents` table)
   against the stored hash
 - If hash differs: delete old chunks for that `doc_id`, re-embed, update the hash
@@ -91,14 +91,14 @@ Next session: start with item 11 (GUI analysis and redesign)
 
 ## Tier 5 — Pre-packaging UX completeness
 
-### 15. Quarantine management UI  (`app/app.py`)
+### 15. Quarantine management UI  ✅  (`app/app.py`)
 - Full sub-tab listing files in `raw/quarantine/` grouped by reason
 - Per-file "Ignore" (mark permanently skipped) and "Force Ingest" (bypass quarantine)
 - Reduces friction for users with Word-blocked files: instead of hunting in Explorer,
   they can see and act on every blocked file from within the app
 - Effort: 3–4 hours
 
-### 16. Auto-GPU detection  (`app/config.py`, `app/llm.py`)
+### 16. Auto-GPU detection  ✅  (`app/llm.py`)
 - Detect at startup: if `torch.cuda.is_available()` and a CUDA-capable llama-cpp build
   is present, set `N_GPU_LAYERS = 32` (safe default for Phi-3.5-mini on most GPUs)
 - Log the decision at startup so the user can see whether GPU is active
@@ -109,7 +109,6 @@ Next session: start with item 11 (GUI analysis and redesign)
 ## Tier 6 — Packaging & distribution
 
 ### 17. PyInstaller / portable launcher
-- Only feasible after Tier 4 is complete (absolute paths break frozen builds)
 - Use `--onedir` mode (not `--onefile` — llama-cpp native libs won't bundle cleanly)
 - Update `_PROJECT_ROOT` detection to handle `sys.frozen` (PyInstaller) vs source mode:
   ```python
@@ -122,13 +121,41 @@ Next session: start with item 11 (GUI analysis and redesign)
 - `setup.bat` remains for fresh-install (Python + deps); PyInstaller build produces a
   separate launcher that doesn't require Python to be installed
 
+**Target machine: CPU-only (integrated graphics, no dedicated GPU)**
+- Ship the standard CPU llama-cpp-python wheel — no CUDA dependencies to bundle
+- detect_n_gpu_layers() will correctly return 0 and the app runs on CPU
+- Standard build: `build/make_release.bat` — runs PyInstaller, smoke test, zips dist/
+
+---
+
+## Tier 7 — Post-packaging polish
+
+### 18. Deep GUI analysis and redesign (round 2)
+- With the full feature set complete and the app running stably, do a
+  comprehensive usability and visual review against real pastoral use:
+  - Information hierarchy: does the pastor know exactly what to do on first launch?
+  - Quarantine tab: is the per-file list usable with 4,700+ entries, or does it
+    need grouping, filtering, or pagination?
+  - Typography, spacing, colour refinement — push beyond Gradio defaults toward a
+    genuinely bespoke pastoral aesthetic
+  - Accessibility: contrast ratios, keyboard navigation, label clarity
+  - Feedback from the end user after first real-world use should drive this pass
+- Effort: 2–4 hours depending on user feedback scope
+- Prerequisite: item 17 shipped and user has used the packaged build
+
 ---
 
 ## Execution order
 
 ```
-Now    →  Tier 3 (items 10–11)   quick wins: max results + GUI polish
-Next   →  Tier 4 (items 12–14)   portability refactor, prep for packaging
-Then   →  Tier 5 (items 15–16)   quarantine UI + auto-GPU (pre-packaging UX)
-Final  →  Tier 6 (item 17)       packaging, test on clean machine
+Done   →  Tiers 1–5 (items 1–16)  ✅ complete
+Next   →  Tier 6 (item 17)         PyInstaller packaging, test on clean machine
+Final  →  Tier 7 (item 18)         GUI polish round 2, driven by real-world use
 ```
+
+### Notes on future acceleration (post-delivery, not in scope)
+- **Vulkan backend** (Intel/AMD integrated GPU): modest 1.5–2× LLM speedup without
+  CUDA complexity; requires Vulkan-compiled llama-cpp-python wheel — worth exploring
+  for a future version once the target machine spec is confirmed
+- **NPU support** (Intel NPU / Qualcomm QNN): requires explicit backend compilation;
+  not broadly available via standard pip wheels yet — monitor llama.cpp releases

@@ -1,25 +1,25 @@
 # sermon-notes-offline — Project Context
 
 Fully offline RAG desktop application for a pastor to query 27+ years of sermon notes.
-Runs on Windows (native) and Linux/WSL. No cloud services required.
+Runs on Windows (native). No cloud services. No internet required at runtime.
 
 ---
 
 ## Architecture Overview
 
 ```
-SampleData/  (or any source dir)
+<sermon library folder>/   (any path — set in UI, persisted to data/settings.json)
        │
        ▼
 build/01_ingest_files.py   ← detect format, parse text, apply 10-step quarantine filter
-       │  writes → data/documents/<doc_id>.json   (one per accepted file)
+       │  writes → data/documents/<doc_id>.json  +  sermons.db documents table
        ▼
-build/02_chunk_embed.py    ← sentence-aware chunking → BGE-small embeddings → FAISS + FTS5
+build/02_chunk_embed.py    ← chunk → BGE-small embeddings → FAISS + FTS5
        │  writes → data/sermons.faiss   (IndexFlatL2, 384-dim)
-       │           data/sermons.db      (SQLite FTS5 chunks + document metadata)
+       │           data/sermons.db      (SQLite FTS5 chunks + document metadata + full text)
        │           data/id_map.json     (FAISS int position → chunk_id string)
        ▼
-app/app.py   ← Gradio UI: query → hybrid retrieval (FAISS + FTS5 + RRF) → Phi-3.5-mini → answer
+app/app.py   ← Gradio UI: query → hybrid retrieval (FAISS+FTS5+RRF) → Phi-3.5-mini → answer
 ```
 
 ---
@@ -33,41 +33,42 @@ app/app.py   ← Gradio UI: query → hybrid retrieval (FAISS + FTS5 + RRF) → 
 | `format_detect.py` | Read magic bytes → `'ole2'`, `'rtf'`, `'ooxml'`, or `'unknown'` |
 | `normalize_scripture.py` | Map any book alias to canonical name (e.g. `"1Cor"` → `"1 Corinthians"`) |
 | `parse_filename.py` | Extract scripture ref / date / series number / title from filename stem |
-| `chunk_text.py` | Sentence-aware sliding window chunker; protect/restore abbreviations for regex compat |
+| `chunk_text.py` | Sentence-aware sliding window chunker |
 
 ### Build pipeline (`build/`)
 
 | Script | Responsibility |
 |--------|---------------|
-| `01_ingest_files.py` | Walk source dir; dispatch OLE2/RTF/DOCX/PPTX parsers; 10-step quarantine; write JSON |
-| `02_chunk_embed.py` | Load JSON docs; chunk; embed with BGE-small-en-v1.5; write FAISS + FTS5 + id_map |
+| `01_ingest_files.py` | Walk source dir; dispatch OLE2/RTF/DOCX/PPTX parsers; 10-step quarantine; write JSON + DB |
+| `02_chunk_embed.py` | Load JSON docs (or DB fallback); chunk; embed; write FAISS + FTS5 + id_map |
 
 ### App (`app/`)
 
 | Module | Responsibility |
 |--------|---------------|
 | `config.py` | All constants and paths — single source of truth |
-| `retriever.py` | `load_retriever()` factory; `Retriever.search()` hybrid dense+sparse+RRF |
-| `llm.py` | `load_llm()` factory; `LLM.generate()` wraps llama-cpp Phi-3.5-mini-instruct |
-| `app.py` | Gradio Blocks UI; loads retriever + LLM once at startup; graceful LLM degradation |
+| `logging_config.py` | Rotating file logger (5 MB × 3); `logs/app.log` |
+| `retriever.py` | `load_retriever(sermon_root=)` factory; hybrid dense+sparse+RRF search |
+| `llm.py` | `load_llm()` factory; `detect_n_gpu_layers()` auto-GPU; `LLM.generate()` |
+| `app.py` | Gradio Blocks UI; 3 tabs: Search, Quarantine, Manage Archive |
 
 ---
 
 ## Data Flow
 
-1. **Ingest** — `01_ingest_files.py` reads each source file, detects format via magic bytes,
-   parses to plain text, runs 10-step quarantine checks, writes accepted files as JSON to
-   `data/documents/`.
-2. **Chunk + Embed** — `02_chunk_embed.py` loads the JSONs, splits text into overlapping
-   ~150-word windows, encodes each chunk with BGE-small-en-v1.5 (384-dim, normalized),
-   adds vectors to a `faiss.IndexFlatL2`, inserts chunk text into SQLite FTS5, saves all
-   three artifacts.
-3. **Query** — `app.py` loads the three artifacts once at startup. On each query:
-   - FAISS ANN search with `EMBED_QUERY_PREFIX` prepended to the query
-   - FTS5 BM25 keyword search with sanitized token OR expression
-   - Reciprocal Rank Fusion (RRF, K=60) merges both ranked lists
-   - Top-5 chunks above `CONFIDENCE_THRESHOLD` passed to Phi-3.5-mini
-   - LLM answers strictly from provided excerpts; cites title + scripture ref
+1. **Ingest** — `01_ingest_files.py` reads each source file, detects format, parses to plain text,
+   runs 10-step quarantine checks, writes accepted files as JSON to `data/documents/` AND inserts
+   into the `documents` table in `sermons.db` (sha256, relative source_file path, full text).
+2. **Chunk + Embed** — `02_chunk_embed.py` loads from JSON (falls back to DB if JSON absent),
+   splits text into ~150-word windows, encodes with BGE-small-en-v1.5 (384-dim),
+   adds vectors to `IndexFlatL2`, inserts into SQLite FTS5, saves all artifacts.
+   Incremental mode: compares sha256 against DB registry — only new/changed docs are embedded.
+3. **Query** — `app.py` loads artifacts once at startup. On each query:
+   - FAISS ANN search (with BGE query prefix)
+   - FTS5 BM25 keyword search (sanitized OR tokens)
+   - Reciprocal Rank Fusion (K=60) merges both lists
+   - Always fetches MAX_TOP_K=50; shows min(slider, high-confidence) results
+   - Top 4 chunks passed to Phi-3.5-mini; LLM cites title + scripture ref
 
 ---
 
@@ -78,13 +79,13 @@ app/app.py   ← Gradio UI: query → hybrid retrieval (FAISS + FTS5 + RRF) → 
 | 1 | `.Identifier`, `.csv`, `.md` | Silent skip |
 | 2 | Extension `.pub` | `format_pub/` |
 | 3 | Admin keyword in filename | `filename_flagged/` |
-| 4 | Parse fails | `manual_review/` |
+| 4 | Parse fails / Word-blocked | `manual_review/` |
 | 5 | `word_count < MIN_CHUNK_WORDS` | `too_short/` |
 | 6 | PPTX: >80% short-line-only slides | `worship_slides/` |
 | 7 | PPTX: <3 text-bearing slides | `sparse_pptx/` |
 | 8 | Faith keyword hits < 2 | `non_faith/` |
 | 9 | SHA-256 already seen | `duplicates/` |
-| 10 | — | **Accepted → write JSON** |
+| 10 | — | **Accepted → write JSON + DB row** |
 
 ---
 
@@ -94,11 +95,9 @@ app/app.py   ← Gradio UI: query → hybrid retrieval (FAISS + FTS5 + RRF) → 
 |-----------|-----------------|--------|
 | `.docx` | `PK\x03\x04` magic (OOXML) | `python-docx` |
 | `.pptx` | `PK\x03\x04` magic (OOXML) | `python-pptx` |
-| `.doc` / `.DOC` | `\xd0\xcf\x11\xe0` (OLE2) | **Windows:** Word COM via `pywin32`; **Linux:** `antiword -t` |
-| `.doc` (some) | `{\` magic (RTF) | Regex stripper — strips control words, decodes `\'XX` cp1252 escapes |
+| `.doc` / `.DOC` | `\xd0\xcf\x11\xe0` (OLE2) | Word COM via `pywin32` (Windows) |
+| `.doc` (some) | `{\` magic (RTF) | Regex stripper |
 | `.pub` | OLE2 subtype | Quarantined — no free parser |
-
-A single Word COM instance is opened once per ingest run on Windows (not per file) for performance.
 
 ---
 
@@ -106,215 +105,197 @@ A single Word COM instance is opened once per ingest run on Windows (not per fil
 
 | Constant | Value | Notes |
 |----------|-------|-------|
-| `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | 384-dim, ~33 MB download |
-| `EMBED_QUERY_PREFIX` | `"Represent this sentence..."` | Required for BGE asymmetric retrieval |
-| `EMBEDDING_DIM` | `384` | Must match FAISS index dim |
-| `MODEL_PATH` | `models/Phi-3.5-mini-instruct-Q4_K_M.gguf` | ~2.4 GB, download separately |
-| `CTX_WINDOW` | `4096` | Phi-3.5-mini context length |
-| `N_GPU_LAYERS` | `0` | Set >0 to offload layers to GPU |
-| `N_THREADS` | `max(1, cpu_count//2)` | Guards against `None` on some VMs |
-| `TOP_K` | `5` | Default chunks returned to LLM |
-| `MAX_TOP_K` | `15` | Slider upper bound in Gradio UI |
+| `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | 384-dim |
+| `MODEL_PATH` | `models/Phi-3.5-mini-instruct-Q4_K_M.gguf` | ~2.4 GB |
+| `CTX_WINDOW` | `4096` | Phi-3.5-mini context |
+| `N_GPU_LAYERS` | `0` | Override; auto-detection via `detect_n_gpu_layers()` |
+| `TOP_K` | `5` | Default slider value (minimum shown) |
+| `MAX_TOP_K` | `50` | Slider ceiling |
+| `AUTO_EXPAND_THRESHOLD` | `0.023` | ≈70% of RRF max — auto-expands results beyond slider |
+| `LOW_CONFIDENCE_THRESHOLD` | `0.018` | Below this, warn user |
 | `RRF_K` | `60` | Reciprocal Rank Fusion constant |
-| `CONFIDENCE_THRESHOLD` | `0.005` | Min RRF score (max ~0.033 with K=60) |
-| `MIN_CHUNK_WORDS` | `50` | Discard chunks shorter than this |
-| `COMMENTARY_CHUNK_WORDS` | `150` | Target chunk size |
-| `DB_PATH` | `data/sermons.db` | SQLite FTS5 |
-| `FAISS_PATH` | `data/sermons.faiss` | FAISS IndexFlatL2 |
-| `ID_MAP_PATH` | `data/id_map.json` | `{int_pos: chunk_id}` |
-| `DOCUMENTS_DIR` | `data/documents` | Intermediate JSON store |
+| `SERMON_ROOT` | `""` | Resolved at runtime from `data/settings.json` |
+| `QUARANTINE_ROOT` | `raw/quarantine` | 8 reason subdirs |
+| `DB_PATH` | `data/sermons.db` | SQLite FTS5 + documents table |
+| `FAISS_PATH` | `data/sermons.faiss` | IndexFlatL2 |
+| `SETTINGS_PATH` | `data/settings.json` | Persisted UI settings |
+
+---
+
+## UI — Three Tabs
+
+### 🔍 Search
+- Full-width query box; Enter or Search button submits
+- Answer box with pastoral styling (warm left border accent)
+- Matching Passages dataframe (up to MAX_TOP_K rows)
+- Min. results slider: sets floor; auto-expansion adds high-confidence results beyond it
+  without re-searching (slider change re-slices cached pool via `expand_results()`)
+- Row click or Row # + Open File button opens source file in native app
+- `chunks_state` gr.State stores the full MAX_TOP_K pool fetched per query
+
+### ⚠️ Quarantine
+- Summary line with Refresh button
+- One accordion per non-empty bucket, ordered by descending file count
+- `manual_review` (Word-blocked .doc) opens by default; hint links to Unblock button
+- Buckets >200 files capped at 200 with batch-unblock guidance
+- Per-file: Force Ingest (unblock + copy to library + re-ingest + reload retriever)
+  or Ignore (permanent delete from quarantine)
+
+### 📁 Manage Archive
+- Sermon library folder path + Browse button (Windows native tkinter picker)
+- Process New Files (incremental) / Full Rebuild buttons
+- Summary markdown + collapsed Technical log accordion
+- Unblock Sermon Library (PowerShell Unblock-File, Windows only)
+- Open Log Folder button
+
+---
+
+## Path Portability
+
+`source_file` is stored **relative** to the sermon library root (e.g. `2019/Grace.docx`).
+The retriever resolves it to absolute at query time: `Path(sermon_root) / relative_path`.
+`sermon_root` is read from `data/settings.json` at startup — never hardcoded.
+
+---
+
+## DB Consolidation
+
+`sermons.db` documents table schema:
+```sql
+CREATE TABLE documents (
+    doc_id        TEXT PRIMARY KEY,
+    sha256        TEXT NOT NULL,
+    source_file   TEXT NOT NULL,   -- relative path
+    title         TEXT,
+    scripture_ref TEXT,
+    date          TEXT,
+    format        TEXT,
+    word_count    INTEGER,
+    text          TEXT,            -- full document text
+    ingested_at   TEXT DEFAULT (datetime('now'))
+);
+```
+`02_chunk_embed.py` falls back to this table if `data/documents/` JSON files are absent,
+enabling a pre-built search bundle to ship without the intermediate JSON staging files.
+
+---
+
+## SHA-256 Stale Detection
+
+During `--incremental`, `02_chunk_embed.py` queries `SELECT doc_id, sha256 FROM documents`,
+compares against each doc's current hash:
+- **New doc_id** → embed and insert
+- **Same hash** → skip (no change)
+- **Changed hash** → remove old SQLite chunks, re-embed, update hash; warn that a Full Rebuild
+  is needed to purge orphaned FAISS vectors (IndexFlatL2 doesn't support deletion)
+
+---
+
+## Auto-GPU Detection (`app/llm.py`)
+
+`detect_n_gpu_layers()` at LLM load time:
+1. If `N_GPU_LAYERS != 0` in config → use that value (manual override)
+2. `llama_cpp.llama_supports_gpu_offload()` → True means CUDA/Metal compiled wheel
+3. `torch.cuda.is_available()` → fallback
+4. Returns 0 (CPU) if no GPU confirmed
+
+Default when GPU detected: 32 layers (all of Phi-3.5-mini).
+Target deployment machine is CPU-only; ship standard CPU wheel.
+
+---
+
+## Logging
+
+`app/logging_config.py`:
+- `logs/app.log` — RotatingFileHandler, 5 MB × 3 files
+- stderr — WARNING+ only
+- "Open Log Folder" button in Manage Archive tab opens `logs/` in Explorer
 
 ---
 
 ## Dependencies
 
-### Build phase (`build/requirements_build.txt`)
+### Build (`build/requirements_build.txt`)
 - `sentence-transformers>=3.0` — BGE-small embedding
 - `faiss-cpu>=1.8` — vector index
-- `python-docx>=1.1` — `.docx` parsing
-- `python-pptx>=0.6` — `.pptx` parsing
-- `numpy>=1.26`
-- `tqdm>=4.66`
-- `pywin32>=306` *(Windows only, auto-selected via `sys_platform` marker)*
+- `python-docx>=1.1`, `python-pptx>=0.6` — OOXML parsing
+- `numpy>=1.26`, `tqdm>=4.66`
+- `pywin32>=306` *(Windows only)*
 
-### App phase (`app/requirements_app.txt`)
-- `gradio>=5.0` — Blocks web UI (tested with 6.11)
-- `llama-cpp-python==0.3.16` — Phi-3.5-mini inference
-- `faiss-cpu>=1.8`
-- `sentence-transformers>=3.0`
-- `numpy>=1.26`
+### App (`app/requirements_app.txt`)
+- `gradio>=6.0` — Blocks web UI (tested with 6.12)
+- `llama-cpp-python==0.3.16` — CPU build for target machine
+- `faiss-cpu>=1.8`, `sentence-transformers>=3.0`, `numpy>=1.26`
 
 ### System
 - Python 3.11
 - SQLite 3.35+ with FTS5 (standard in Python 3.11)
-- **Windows:** Microsoft Word (for `.doc` COM parsing)
-- **Linux/WSL:** `antiword` (`sudo apt-get install antiword`)
+- Microsoft Word (for `.doc` COM parsing on Windows)
 
 ---
 
-## Package / Import Notes
+## Environment Setup (Windows)
 
-- `app/__init__.py` and `build/__init__.py` are required empty files. Without them,
-  Python treats `app/` as a namespace package and `app/app.py` shadows the `app` package
-  name on the `sys.path`, causing `ModuleNotFoundError: 'app' is not a package`.
-- All scripts add the project root to `sys.path` via
-  `sys.path.insert(0, str(Path(__file__).resolve().parent.parent))`.
-
----
-
-## Environment Setup
-
-### Windows (native)
-
-```powershell
-# Prerequisites:
-#   Python 3.11   https://python.org/downloads
-#   uv            https://docs.astral.sh/uv/getting-started/installation/
-#   Microsoft Word (for .doc parsing)
-
+```bat
 cd open-sermon-notes
-
 uv venv .venv --python 3.11
 .venv\Scripts\activate
 
-# PyTorch — choose CPU or CUDA build:
-# CPU only (smaller, works everywhere):
 pip install torch --index-url https://download.pytorch.org/whl/cpu
-# NVIDIA GPU (CUDA 12.x driver or newer — cu128 is compatible with CUDA 13.x drivers):
-pip install torch --index-url https://download.pytorch.org/whl/cu128
+uv pip install -r build\requirements_build.txt
+uv pip install -r app\requirements_app.txt
 
-# All other dependencies (pywin32 installed automatically on Windows)
-uv pip install -r sermon-notes-offline\build\requirements_build.txt --python .venv\Scripts\python.exe
-uv pip install -r sermon-notes-offline\app\requirements_app.txt --python .venv\Scripts\python.exe
-
-# Verify pywin32 COM registration (must be run as Administrator)
+:: Verify pywin32 (run as Administrator)
 python .venv\Lib\site-packages\pywin32_postinstall.py -install
-python -c "import win32com.client; print('pywin32 OK')"
-
-# Verify GPU (optional)
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-```
-
-### Linux / WSL
-
-```bash
-cd sermon-notes-offline
-sudo apt-get install -y antiword
-
-uv venv .venv --python 3.11
-uv pip install torch                           # CUDA wheel auto-selected
-uv pip install -r build/requirements_build.txt
-uv pip install -r app/requirements_app.txt
 ```
 
 ---
 
 ## Running the Pipeline
 
-### Windows
-```powershell
-# 1. Ingest source files
-python build\01_ingest_files.py --source SampleData --verbose
+```bat
+:: 1. Ingest
+python build\01_ingest_files.py --source "C:\Sermons" --verbose
 
-# 2. Chunk + embed
+:: 2. Embed
 python build\02_chunk_embed.py
 
-# 3. Download LLM model (~2.4 GB, one-time)
+:: 3. Download model (one-time, ~2.4 GB)
 python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='bartowski/Phi-3.5-mini-instruct-GGUF', filename='Phi-3.5-mini-instruct-Q4_K_M.gguf', local_dir='models')"
 
-# 4. Launch app
-python app\app.py --port 7860
+:: 4. Launch
+launch.bat
 ```
-
-### Linux / WSL
-```bash
-.venv/bin/python build/01_ingest_files.py --source SampleData/ --verbose
-.venv/bin/python build/02_chunk_embed.py
-.venv/bin/python app/app.py --port 7860
-```
-
-Open `http://127.0.0.1:7860` in your browser.
 
 ---
 
-## Production Readiness Features (Sprint 2)
+## Production Corpus (April 2026)
 
-### Incremental Indexing
-- `build/01_ingest_files.py` now maintains `data/processed.json` — a persistent
-  `{source_path: sha256}` registry. On each run, previously accepted file hashes are
-  pre-loaded so cross-session duplicates are detected. Registry is saved atomically at end.
-- `build/02_chunk_embed.py` accepts `--incremental` flag. When set, it loads the existing
-  FAISS index + SQLite DB, finds doc_ids not yet indexed, embeds only those, appends vectors
-  via `index.add()`, and extends `id_map.json`. Full rebuild is unchanged (no flag or `--force`).
+| Metric | Value |
+|--------|-------|
+| Source files processed | 14,110 |
+| Accepted | 10,192 |
+| FAISS vectors | ~585,000 |
+| manual_review (Word-blocked) | 4,733 |
+| duplicates | 11,063 |
+| non_faith | 1,061 |
+| too_short | 531 |
 
-### GUI Changes (`app/app.py`)
-- **Theme:** `gr.themes.Soft()` with custom CSS (hides Gradio footer, styled answer box)
-- **Result count slider:** 1–15 results (configurable via `MAX_TOP_K` in config.py)
-- **Enter-to-search:** `query_box` uses `lines=1, max_lines=6`; Enter key submits via
-  `query_box.submit()` wired alongside `search_btn.click()`
-- **Row click file open:** `results_df.select()` calls `on_row_select()` which uses
-  `_extract_row_index()` to handle both `gr.SelectData` and plain `(row, col)` tuple forms
-  across Gradio versions; gracefully falls back with a message if row index is undetectable
-- **Result # + Open File button:** reliable fallback always present — enter row number,
-  click Open File; works in all Gradio builds
-- **LLM context budget:** `llm.py` caps chunks sent to LLM at 4 (`_LLM_MAX_CHUNKS`),
-  truncates text per chunk to fit within 4096-token window; table still shows all `top_k`
-- **Manage Archive tab:** folder path input + "Process New Files" (incremental) and
-  "Full Rebuild" buttons; captured subprocess stdout/stderr shown in log textbox; retriever
-  reloaded in-place after each operation
-- **Source File column:** displays basename only (full path stored in `chunks_state`)
-- **Dataframe:** `row_count=(15, "fixed")` — all rows rendered upfront
+---
 
-### Known Gradio Compatibility Notes
-- `Dataframe.select()` event passes `gr.SelectData` in standard Gradio 5.x builds, but
-  some builds pass the full dataframe value (list of row dicts) instead — `_extract_row_index()`
-  handles this gracefully and falls back to the Result # button
-- `pywin32` post-install registration requires **Administrator** privileges on Windows;
-  `pip install pywin32` (not uv) runs registration automatically as part of the wheel install
-- All install commands must be run from inside `open-sermon-notes\` (the repo root where
-  `.venv\` lives), not from parent directories
+## Test Suite
 
-### Windows Deployment
-- `setup.bat` — first-time setup: checks Python 3.11, installs uv, creates venv, installs
-  PyTorch CPU + all dependencies, verifies pywin32, downloads LLM model
-- `launch.bat` — one-click start: activates venv, opens browser, launches `app/app.py`
-
-### Scalability Notes
-- `IndexFlatL2` at 55k vectors (384-dim) scans in ~2–5ms; no IVF needed until ~1M vectors
-- First full ingest of 14k files may take overnight on Windows (COM automation bottleneck)
-- Subsequent incremental runs touch only new files — expected seconds for small batches
-
-### GPU Embedding
-`sentence-transformers` uses CUDA automatically when `torch.cuda.is_available()` is `True`.
-The CPU PyTorch build installed by `setup.bat` must be replaced with a CUDA build:
+178 tests across 6 test files. Run with:
 ```bat
-.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu128 --force-reinstall
+.venv\Scripts\python.exe -m pytest tests\ -v
 ```
-- `cu128` is compatible with CUDA 12.x **and** 13.x drivers (PyTorch does not yet ship a cu132 build)
-- Verify: `.venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available())"`
-- GPU embedding of ~11k docs takes ~2–5 min vs 20–30 min on CPU
 
-### Production Corpus (April 2026)
-- **14,110 files** processed from 27+ years of sermons
-- **10,192 accepted** → JSON docs in `data/documents/`
-- **~60k+ FAISS vectors** (IndexFlatL2, 384-dim)
-- **581 manual_review** — mostly Word-blocked `.doc` files; recoverable by adding sermon
-  folder to Word Trusted Locations then re-running ingest + `--incremental` embed
-
----
-
-## Verified Results (SampleData, 253 files)
-
-| Outcome | Count |
-|---------|-------|
-| accepted | 153 |
-| skipped (.Identifier / .csv / .md) | 21 |
-| too_short | 19 |
-| non_faith | 18 |
-| filename_flagged | 15 |
-| format_pub | 13 |
-| manual_review | 10 |
-| worship_slides | 3 |
-| duplicates | 1 |
-| **FAISS vectors** | **7,240** |
-| **FTS5 chunks** | **7,240** |
+| File | Coverage |
+|------|---------|
+| `test_app_handlers.py` | handle_query, expand_results, open_file, on_row_select, quarantine handlers, settings, archive handlers |
+| `test_config.py` | config constants, thresholds |
+| `test_incremental_embed.py` | init_db, build_index_incremental, load_documents_from_db, sha256 stale detection |
+| `test_ingest_registry.py` | hash registry load/save |
+| `test_parse_filename.py` | filename parser |
+| `test_retriever_utils.py` | FTS5 sanitize, RRF fusion |
+| `test_llm.py` | detect_n_gpu_layers, _format_chunk, _build_user_message |
