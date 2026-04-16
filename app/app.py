@@ -604,9 +604,50 @@ def full_rebuild(folder: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 CSS = """
-#search-col { max-width: 860px; margin: auto; }
-.answer-box { background: #f8f8f5; border-radius: 8px; padding: 1rem; }
-.results-table { font-size: 0.88rem; }
+/* ── Overall container ───────────────────────────────────────────────── */
+.gradio-container {
+    font-family: Georgia, 'Times New Roman', serif;
+    background-color: #f9f7f4;
+}
+
+/* ── App header ──────────────────────────────────────────────────────── */
+#app-header {
+    text-align: center;
+    padding: 0.75rem 0 1.25rem;
+    border-bottom: 1px solid #e4ddd4;
+    margin-bottom: 1rem;
+}
+
+/* ── Search: answer box ──────────────────────────────────────────────── */
+.answer-box {
+    background: #ffffff;
+    border-left: 4px solid #8b5e3c;
+    border-radius: 0 6px 6px 0;
+    padding: 1rem 1.5rem;
+    line-height: 1.8;
+    color: #2a1f17;
+    min-height: 2.5rem;
+}
+.answer-box p { margin: 0; }
+
+/* ── Search: results table ───────────────────────────────────────────── */
+.passages-table { font-size: 0.85rem; }
+.passages-table table th {
+    background-color: #f0ebe3 !important;
+    color: #3b2a1e !important;
+    font-weight: 600;
+}
+
+/* ── Shared hint / status text ───────────────────────────────────────── */
+.status-hint { color: #9a8070; font-size: 0.82rem; }
+
+/* ── Archive: section dividers ───────────────────────────────────────── */
+.archive-divider {
+    border: none;
+    border-top: 1px solid #e4ddd4;
+    margin: 1.25rem 0;
+}
+
 footer { display: none !important; }
 """
 
@@ -619,24 +660,43 @@ def build_ui():
     _saved_folder = _settings.get('sermon_library_folder', '')
 
     with gr.Blocks(title="Sermon Note Search", theme=gr.themes.Soft(), css=CSS) as demo:
-        gr.Markdown("# Sermon Note Search")
+
+        # ── App header ────────────────────────────────────────────────────
+        gr.HTML("""
+            <div id="app-header">
+                <h1 style="font-family:Georgia,serif;font-size:1.9rem;font-weight:normal;
+                           color:#3b2a1e;letter-spacing:0.02em;margin:0 0 0.3rem">
+                    Sermon Note Search
+                </h1>
+                <p style="color:#9a8070;font-size:0.88rem;margin:0">
+                    Private &amp; offline — your notes never leave this computer
+                </p>
+            </div>
+        """)
 
         with gr.Tabs():
 
             # ----------------------------------------------------------------
             # Search tab
             # ----------------------------------------------------------------
-            with gr.Tab("Search"):
+            with gr.Tab("🔍  Search"):
                 chunks_state = gr.State([])
 
-                with gr.Row(elem_id="search-col"):
-                    query_box = gr.Textbox(
-                        label="Your question",
-                        lines=1,
-                        max_lines=6,
-                        placeholder="Ask about a topic, scripture, or season…",
-                        scale=4,
-                    )
+                # Full-width query box
+                query_box = gr.Textbox(
+                    label="",
+                    show_label=False,
+                    lines=2,
+                    max_lines=6,
+                    placeholder=(
+                        "Ask about a topic, scripture, or season…\n"
+                        "e.g. 'forgiveness in the Psalms'  ·  'Advent 2012'  ·  'prodigal son'"
+                    ),
+                )
+
+                # Search button + Min. results slider on the same row
+                with gr.Row():
+                    search_btn = gr.Button("Search", variant="primary", scale=3)
                     top_k_slider = gr.Slider(
                         minimum=1,
                         maximum=MAX_TOP_K,
@@ -646,38 +706,36 @@ def build_ui():
                         scale=1,
                     )
 
-                search_btn = gr.Button("Search", variant="primary")
-
+                # Answer — shows a soft hint before the first search
                 answer_md = gr.Markdown(
-                    label="Answer",
-                    value="",
+                    value="_Enter a topic, scripture, or sermon theme above to search your notes._",
                     elem_classes=["answer-box"],
                 )
 
-                gr.HTML("<hr style='border:none;border-top:1px solid #ddd;margin:0.5rem 0'>")
+                gr.HTML("<hr class='archive-divider'>")
 
                 results_df = gr.Dataframe(
-                    headers=["#", "Title", "Scripture", "Date", "Snippet", "Match %", "Source File"],
+                    headers=["#", "Title", "Scripture", "Date", "Excerpt", "Match %", "Source File"],
                     datatype=["number", "str", "str", "str", "str", "str", "str"],
-                    label="Source Chunks  (click a row to open the file)",
+                    label="Matching Passages  —  click a row to open the source file",
                     wrap=True,
-                    elem_classes=["results-table"],
+                    elem_classes=["passages-table"],
                     row_count=(MAX_TOP_K, "fixed"),
                 )
 
                 with gr.Row():
                     result_num = gr.Number(
                         value=1, minimum=1, maximum=MAX_TOP_K, step=1,
-                        label="Result #", scale=1,
+                        label="Row", scale=1,
                     )
-                    open_btn = gr.Button("Open File", scale=2)
+                    open_btn = gr.Button("📖  Open File", scale=2)
                     open_status = gr.Textbox(
                         label="", interactive=False, show_label=False,
-                        placeholder="Click a row or enter Result # and click Open File…",
+                        placeholder="Click a row in the table, or enter a row number and click Open File",
                         scale=4,
                     )
 
-                status_md = gr.Markdown(value="")
+                status_md = gr.Markdown(value="", elem_classes=["status-hint"])
 
                 # Search events
                 search_inputs = [query_box, top_k_slider]
@@ -687,35 +745,56 @@ def build_ui():
 
                 # Row-click file open (best-effort — depends on Gradio build)
                 results_df.select(fn=on_row_select, inputs=[chunks_state], outputs=[open_status])
-                # Reliable fallback: Result # number input + button
+                # Reliable fallback: Row number input + button
                 open_btn.click(fn=open_file, inputs=[result_num, chunks_state], outputs=[open_status])
 
             # ----------------------------------------------------------------
             # Manage Archive tab
             # ----------------------------------------------------------------
-            with gr.Tab("Manage Archive"):
+            with gr.Tab("📁  Manage Archive"):
+
+                # ── Section: Library folder ───────────────────────────────
+                gr.HTML("""
+                    <h3 style="font-family:Georgia,serif;font-weight:normal;
+                               color:#3b2a1e;margin:0.5rem 0 0.4rem">
+                        Sermon Library Folder
+                    </h3>
+                """)
                 gr.Markdown(
-                    "### Sermon library folder\n"
-                    "Set this to your **main sermon library folder** — the single folder "
-                    "(or folder tree) where all your sermon files live. "
-                    "Add new sermon files into that folder first, then click "
-                    "**Process New Files** to index them."
+                    "Set this to the folder where all your sermon files live. "
+                    "Add new files there first, then click **Process New Files** to index them.",
+                    elem_classes=["status-hint"],
                 )
 
                 with gr.Row():
                     folder_box = gr.Textbox(
-                        label="Sermon library folder",
+                        label="",
+                        show_label=False,
                         placeholder=r"e.g. C:\Sermons  or  E:\Ministry\Sermons",
                         value=_saved_folder,
                         lines=1,
                         scale=5,
                     )
                     if sys.platform == 'win32':
-                        browse_btn = gr.Button("📁 Browse…", scale=1)
+                        browse_btn = gr.Button("📁  Browse…", scale=1)
+
+                # ── Section: Update index ─────────────────────────────────
+                gr.HTML("<hr class='archive-divider'>")
+                gr.HTML("""
+                    <h3 style="font-family:Georgia,serif;font-weight:normal;
+                               color:#3b2a1e;margin:0 0 0.4rem">
+                        Update Search Index
+                    </h3>
+                """)
+                gr.Markdown(
+                    "_Use **Process New Files** for day-to-day additions. "
+                    "**Full Rebuild** only if search results seem wrong or incomplete._",
+                    elem_classes=["status-hint"],
+                )
 
                 with gr.Row():
-                    process_btn = gr.Button("➕ Process New Files", variant="primary")
-                    rebuild_btn = gr.Button("🔄 Full Rebuild", variant="secondary")
+                    process_btn = gr.Button("➕  Process New Files", variant="primary")
+                    rebuild_btn = gr.Button("🔄  Full Rebuild", variant="secondary")
 
                 archive_summary = gr.Markdown(value="")
 
@@ -728,22 +807,33 @@ def build_ui():
                         max_lines=20,
                     )
 
-                gr.Markdown("---")
+                # ── Section: File security ────────────────────────────────
+                gr.HTML("<hr class='archive-divider'>")
+                gr.HTML("""
+                    <h3 style="font-family:Georgia,serif;font-weight:normal;
+                               color:#3b2a1e;margin:0 0 0.4rem">
+                        File Security
+                    </h3>
+                """)
                 gr.Markdown(
-                    "**Unblock Sermon Library** — if Word security is blocking `.doc` files, "
-                    "run this to remove the Windows security flag from all files in your library. "
-                    "*Only use this on folders you fully trust.*"
+                    "If Word is blocking `.doc` files, click **Unblock Sermon Library** "
+                    "to remove Windows' security flag from every file in your library. "
+                    "*Only use this on folders you fully trust.*",
+                    elem_classes=["status-hint"],
                 )
-                unblock_btn = gr.Button("🔓 Unblock Sermon Library", variant="secondary")
+                unblock_btn = gr.Button("🔓  Unblock Sermon Library", variant="secondary")
 
+                # ── Section: Diagnostics ──────────────────────────────────
+                gr.HTML("<hr class='archive-divider'>")
                 with gr.Row():
-                    log_btn = gr.Button("📂 Open Log Folder", variant="secondary")
+                    log_btn = gr.Button("📂  Open Log Folder", variant="secondary")
                     log_status = gr.Textbox(
                         label="", interactive=False, show_label=False,
-                        placeholder="Log files are saved to logs/app.log",
+                        placeholder="Application logs are saved to the logs/ folder",
                         scale=4,
                     )
 
+                # Event wiring (unchanged)
                 archive_outputs = [archive_summary, archive_log]
                 process_btn.click(fn=process_new_files, inputs=[folder_box], outputs=archive_outputs)
                 rebuild_btn.click(fn=full_rebuild, inputs=[folder_box], outputs=archive_outputs)
