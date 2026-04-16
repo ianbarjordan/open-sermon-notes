@@ -104,10 +104,68 @@ def _load_components(
 # Query handler
 # ---------------------------------------------------------------------------
 
+def _build_result_rows(chunks: list) -> list:
+    """Convert a list of chunk dicts into Gradio dataframe rows."""
+    RRF_MAX = 2.0 / 61.0
+    rows = []
+    for i, c in enumerate(chunks):
+        snippet = (c.get('text') or '')[:120] + '...'
+        match_pct = f"{min(c.get('score', 0) / RRF_MAX * 100, 100):.0f}%"
+        source_path = c.get('source_file') or ''
+        source_display = Path(source_path).name if source_path else ''
+        rows.append([
+            i + 1,
+            c.get('title') or '',
+            c.get('scripture_ref') or '',
+            c.get('date') or '',
+            snippet,
+            match_pct,
+            source_display,
+        ])
+    return rows
+
+
+def _slice_chunks(all_chunks: list, top_k: int) -> tuple[list, str]:
+    """Apply the min-results floor + auto-expansion logic to an already-fetched list.
+
+    Returns (visible_chunks, status_text).
+    chunks_state always holds the full MAX_TOP_K pool; this function decides what to
+    *show* based on the current slider value.
+    """
+    min_results = int(top_k)
+    base = all_chunks[:min_results]
+    expanded = [
+        c for c in all_chunks[min_results:]
+        if c.get('score', 0) >= AUTO_EXPAND_THRESHOLD
+    ]
+    visible = base + expanded
+
+    if not visible:
+        return [], ""
+
+    max_score = max(c.get('score', 0) for c in visible)
+    if max_score < LOW_CONFIDENCE_THRESHOLD:
+        status = (
+            f"⚠️ Low confidence ({max_score:.3f}) — "
+            "this topic may not be in your archive. "
+            "Results shown are the closest matches available."
+        )
+    elif len(visible) > min_results and expanded:
+        status = (
+            f"{len(visible)} result(s) — {len(expanded)} additional high-confidence "
+            f"match(es) included automatically"
+        )
+    else:
+        status = f"{len(visible)} result(s) returned"
+
+    return visible, status
+
+
 def handle_query(query: str, top_k: int = TOP_K):
     """Search handler — returns (answer, dataframe_rows, status, chunks_state).
 
-    chunks_state is stored in a gr.State so the row-click handler can access it.
+    chunks_state stores the FULL MAX_TOP_K pool so the slider can re-slice it
+    without re-running a search.
     """
     empty = ("Please enter a question.", [], "No query.", [])
 
@@ -126,24 +184,16 @@ def handle_query(query: str, top_k: int = TOP_K):
     if not all_chunks:
         return ("No relevant sermons found for this query.", [], "0 results", [])
 
-    # Auto-expand: always show at least top_k, plus any additional results that score
-    # above AUTO_EXPAND_THRESHOLD (≈70% match) up to MAX_TOP_K.
-    min_results = int(top_k)
-    base = all_chunks[:min_results]
-    expanded = [
-        c for c in all_chunks[min_results:]
-        if c.get('score', 0) >= AUTO_EXPAND_THRESHOLD
-    ]
-    chunks = base + expanded
+    visible, status = _slice_chunks(all_chunks, top_k)
 
     # Build answer via LLM (or fallback if LLM not loaded)
     if _llm is not None:
         try:
-            answer = _llm.generate(query, chunks)
+            answer = _llm.generate(query, visible)
         except Exception as e:
-            answer = f"(LLM error: {e})\n\nTop result: {chunks[0].get('text', '')[:300]}"
+            answer = f"(LLM error: {e})\n\nTop result: {visible[0].get('text', '')[:300]}"
     else:
-        top = chunks[0]
+        top = visible[0]
         answer = (
             f"**Note:** LLM not loaded — showing top match only.\n\n"
             f"**{top.get('title', '(untitled)')}** "
@@ -151,44 +201,19 @@ def handle_query(query: str, top_k: int = TOP_K):
             f"{top.get('text', '')[:500]}..."
         )
 
-    # Theoretical max RRF score: two lists each contribute 1/(RRF_K+1)
-    RRF_MAX = 2.0 / 61.0
-    max_score = max(c.get('score', 0) for c in chunks)
+    # Store the FULL pool in state — slider can expand without re-searching
+    return answer, _build_result_rows(visible), status, all_chunks
 
-    # Build dataframe rows — display basename for Source File column
-    rows = []
-    for i, c in enumerate(chunks):
-        snippet = (c.get('text') or '')[:120] + '...'
-        match_pct = f"{min(c.get('score', 0) / RRF_MAX * 100, 100):.0f}%"
-        source_path = c.get('source_file') or ''
-        source_display = Path(source_path).name if source_path else ''
-        rows.append([
-            i + 1,
-            c.get('title') or '',
-            c.get('scripture_ref') or '',
-            c.get('date') or '',
-            snippet,
-            match_pct,
-            source_display,
-        ])
 
-    if max_score < LOW_CONFIDENCE_THRESHOLD:
-        status = (
-            f"⚠️ Low confidence ({max_score:.3f}) — "
-            "this topic may not be in your archive. "
-            "Results shown are the closest matches available."
-        )
-    else:
-        n = len(chunks)
-        if n > min_results and expanded:
-            status = (
-                f"{n} result(s) — {len(expanded)} additional high-confidence match(es) "
-                f"included automatically"
-            )
-        else:
-            status = f"{n} result(s) returned"
+def expand_results(top_k: int, chunks_state: list):
+    """Re-slice the cached result pool when the slider moves — no new search needed.
 
-    return answer, rows, status, chunks
+    Returns (dataframe_rows, status_text).
+    """
+    if not chunks_state:
+        return [], ""
+    visible, status = _slice_chunks(chunks_state, top_k)
+    return _build_result_rows(visible), status
 
 
 # ---------------------------------------------------------------------------
@@ -198,12 +223,13 @@ def handle_query(query: str, top_k: int = TOP_K):
 def _extract_row_index(evt) -> int | None:
     """Extract the clicked row index from whatever Gradio passes to a select handler.
 
-    Gradio 5.x passes SelectData (has .index attribute).
-    Some builds pass a plain (row, col) tuple of ints.
-    If neither is detected (e.g. full dataframe value passed), returns None.
+    Gradio 5.x passes SelectData (has .index as a non-callable attribute).
+    Older builds may pass a plain (row, col) tuple of ints.
+    Plain Python lists also have an .index *method* (callable) — guard against that.
+    If neither is detected, returns None.
     """
-    # Standard: SelectData with .index = [row, col] or just row int
-    if hasattr(evt, 'index'):
+    # SelectData: evt.index is a property/attribute (not callable), value is [row, col] or int
+    if hasattr(evt, 'index') and not callable(evt.index):
         idx = evt.index
         if isinstance(idx, (list, tuple)):
             return int(idx[0])
@@ -742,6 +768,13 @@ def build_ui():
                 search_outputs = [answer_md, results_df, status_md, chunks_state]
                 search_btn.click(fn=handle_query, inputs=search_inputs, outputs=search_outputs)
                 query_box.submit(fn=handle_query, inputs=search_inputs, outputs=search_outputs)
+
+                # Slider change — re-slice cached results without a new search
+                top_k_slider.change(
+                    fn=expand_results,
+                    inputs=[top_k_slider, chunks_state],
+                    outputs=[results_df, status_md],
+                )
 
                 # Row-click file open (best-effort — depends on Gradio build)
                 results_df.select(fn=on_row_select, inputs=[chunks_state], outputs=[open_status])

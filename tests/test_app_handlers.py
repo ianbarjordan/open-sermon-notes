@@ -100,10 +100,11 @@ def test_handle_query_slider_sets_minimum():
     app_module._retriever = mock_retriever
     app_module._llm = None
 
-    # Slider = 1 → base is 1, but 1 more is high-confidence → 2 total
+    # Slider = 1 → base is 1, but 1 more is high-confidence → 2 rows shown
+    # State holds the full fetched pool (5), not just the visible slice
     _, rows, _, state = app_module.handle_query("grace", top_k=1)
     assert len(rows) == 2
-    assert len(state) == 2
+    assert len(state) == 5  # full pool stored in state
 
 
 def test_handle_query_auto_expand_status():
@@ -182,13 +183,86 @@ def test_handle_query_retriever_exception():
 
 
 # ---------------------------------------------------------------------------
+# _extract_row_index
+# ---------------------------------------------------------------------------
+
+def test_extract_row_index_select_data_list():
+    """Standard Gradio 5 SelectData: evt.index = [row, col]."""
+    evt = mock.MagicMock()
+    evt.index = [3, 1]
+    assert app_module._extract_row_index(evt) == 3
+
+
+def test_extract_row_index_select_data_int():
+    """Some Gradio builds: evt.index is a plain int."""
+    evt = mock.MagicMock()
+    evt.index = 7
+    assert app_module._extract_row_index(evt) == 7
+
+
+def test_extract_row_index_plain_list():
+    """When Gradio passes a plain list (row, col) — no .index attribute that matters."""
+    assert app_module._extract_row_index([2, 0]) == 2
+
+
+def test_extract_row_index_callable_index_is_ignored():
+    """A plain Python list has .index() as a callable method — must not crash."""
+    # Python list: evt.index is the list.index() *method*, not a row number
+    evt = [5, 0]  # plain list — evt.index is callable
+    # Should fall through to the isinstance(evt, list) branch → 5
+    assert app_module._extract_row_index(evt) == 5
+
+
+def test_extract_row_index_none_event():
+    """None returns None without error."""
+    assert app_module._extract_row_index(None) is None
+
+
+# ---------------------------------------------------------------------------
+# expand_results
+# ---------------------------------------------------------------------------
+
+def test_expand_results_empty_state():
+    rows, status = app_module.expand_results(5, [])
+    assert rows == []
+    assert status == ""
+
+
+def test_expand_results_shows_base():
+    from app.config import AUTO_EXPAND_THRESHOLD
+    chunks = _make_chunks(10, score=AUTO_EXPAND_THRESHOLD - 0.005)  # all below threshold
+    rows, status = app_module.expand_results(4, chunks)
+    assert len(rows) == 4  # exactly slider value, no auto-expansion
+
+
+def test_expand_results_auto_expands():
+    from app.config import AUTO_EXPAND_THRESHOLD
+    high = AUTO_EXPAND_THRESHOLD + 0.005
+    chunks = _make_chunks(5, score=high)
+    rows, status = app_module.expand_results(2, chunks)
+    # All 5 are above threshold → all shown
+    assert len(rows) == 5
+    assert 'additional' in status.lower() or '5' in status
+
+
+def test_expand_results_slider_increase_shows_more():
+    from app.config import AUTO_EXPAND_THRESHOLD
+    low = AUTO_EXPAND_THRESHOLD - 0.005
+    chunks = _make_chunks(10, score=low)
+    rows_3, _ = app_module.expand_results(3, chunks)
+    rows_8, _ = app_module.expand_results(8, chunks)
+    assert len(rows_3) == 3
+    assert len(rows_8) == 8
+
+
+# ---------------------------------------------------------------------------
 # on_row_select
 # ---------------------------------------------------------------------------
 
 def _make_select_event(row: int, col: int = 0):
-    """Create a mock gr.SelectData-like event."""
+    """Create a mock gr.SelectData-like event (index is a non-callable attribute)."""
     evt = mock.MagicMock()
-    evt.index = [row, col]
+    evt.index = [row, col]  # MagicMock attribute — not callable
     return evt
 
 
