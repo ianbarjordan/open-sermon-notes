@@ -6,6 +6,7 @@ Usage:
 """
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -17,6 +18,13 @@ from app.config import (  # noqa: E402
     N_THREADS,
     USE_MMAP,
 )
+
+_log = logging.getLogger(__name__)
+
+# Safe default: offload most layers to VRAM when a GPU is detected.
+# 32 layers covers all of Phi-3.5-mini (32 transformer blocks) so the
+# entire model runs on GPU.  Conservative enough for any 4 GB+ VRAM card.
+_GPU_LAYERS_DEFAULT = 32
 
 _SYSTEM_PROMPT = """\
 You are a pastoral research assistant. Your job is to help a pastor find
@@ -117,6 +125,65 @@ class LLM:
 
 
 # ---------------------------------------------------------------------------
+# GPU detection
+# ---------------------------------------------------------------------------
+
+def detect_n_gpu_layers() -> int:
+    """Return the number of model layers to offload to GPU.
+
+    Detection order:
+    1. llama_cpp.llama_supports_gpu_offload() — most reliable; tells us
+       whether the installed llama-cpp-python binary was compiled with
+       CUDA/Metal support.
+    2. torch.cuda.is_available() — fallback for environments where torch
+       is installed alongside llama-cpp.
+    3. Default to 0 (CPU-only) if neither confirms GPU availability.
+
+    Returns N_GPU_LAYERS from config if it was manually set to a non-zero
+    value (i.e. the user has already overridden it), so manual config always
+    takes precedence.
+    """
+    if N_GPU_LAYERS != 0:
+        _log.info("GPU layers: using config override N_GPU_LAYERS=%d", N_GPU_LAYERS)
+        return N_GPU_LAYERS
+
+    # 1. llama_cpp native check
+    try:
+        import llama_cpp
+        if hasattr(llama_cpp, 'llama_supports_gpu_offload'):
+            if llama_cpp.llama_supports_gpu_offload():
+                _log.info(
+                    "GPU detected via llama_cpp.llama_supports_gpu_offload() — "
+                    "offloading %d layers", _GPU_LAYERS_DEFAULT
+                )
+                return _GPU_LAYERS_DEFAULT
+            else:
+                _log.info("llama_cpp reports no GPU offload support — using CPU")
+                return 0
+    except Exception:
+        pass  # llama_cpp not yet importable; fall through
+
+    # 2. torch CUDA check
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device = torch.cuda.get_device_name(0)
+            _log.info(
+                "GPU detected via torch.cuda (%s) — offloading %d layers",
+                device, _GPU_LAYERS_DEFAULT,
+            )
+            return _GPU_LAYERS_DEFAULT
+        else:
+            _log.info("torch.cuda reports no CUDA device — using CPU")
+            return 0
+    except Exception:
+        pass
+
+    _log.info("GPU detection inconclusive — defaulting to CPU (N_GPU_LAYERS=0)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -143,11 +210,17 @@ def load_llm(model_path: str = MODEL_PATH) -> LLM:
             "Install with: .venv/bin/pip install llama-cpp-python"
         )
 
+    n_gpu = detect_n_gpu_layers()
+    if n_gpu > 0:
+        print(f"GPU acceleration enabled — offloading {n_gpu} layers to GPU")
+    else:
+        print("Running on CPU (no compatible GPU detected)")
+
     llama = Llama(
         model_path=model_path,
         n_ctx=CTX_WINDOW,
         n_threads=N_THREADS,
-        n_gpu_layers=N_GPU_LAYERS,
+        n_gpu_layers=n_gpu,
         use_mmap=USE_MMAP,
         verbose=False,
     )
