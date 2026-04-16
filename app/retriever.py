@@ -204,6 +204,7 @@ def load_retriever(
     faiss_path: str = FAISS_PATH,
     idmap_path: str = ID_MAP_PATH,
     model_name: str = EMBED_MODEL,
+    sermon_root: str = SERMON_ROOT,
 ) -> Retriever:
     """Load all artifacts and return a ready Retriever. Called once at startup."""
     import faiss
@@ -223,7 +224,8 @@ def load_retriever(
     model = SentenceTransformer(model_name)
     print(f"Loaded embedding model: {model_name!r}")
 
-    return Retriever(index=index, id_map=id_map, conn=conn, model=model)
+    return Retriever(index=index, id_map=id_map, conn=conn, model=model,
+                     sermon_root=sermon_root)
 
 
 # ---------------------------------------------------------------------------

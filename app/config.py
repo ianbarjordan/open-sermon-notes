@@ -46,9 +46,9 @@ COMMENTARY_CHUNK_WORDS   = 150  # Target size for commentary/exposition chunks
 # Paths  (all relative to project root — never hardcode absolute paths)
 # ---------------------------------------------------------------------------
 # SERMON_ROOT is the base directory for the user's raw sermon files (.doc, .docx).
-# When shipping the "Pre-Computed Search Bundle", source_file paths in the
-# database should be stored RELATIVE to this root to ensure portability.
-SERMON_ROOT         = "SampleData" 
+# Empty string at startup — resolved at runtime from data/settings.json.
+# NEVER hardcode a path here; that breaks portability to the pastor's machine.
+SERMON_ROOT         = ""
 
 DB_PATH             = "data/sermons.db"
 FAISS_PATH          = "data/sermons.faiss"

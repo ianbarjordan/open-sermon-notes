@@ -80,7 +80,10 @@ def _load_components(
 
     try:
         from app.retriever import load_retriever
-        _retriever = load_retriever(db_path=db, faiss_path=faiss, idmap_path=idmap)
+        _settings = load_settings()
+        _sermon_root = _settings.get('sermon_library_folder', '')
+        _retriever = load_retriever(db_path=db, faiss_path=faiss, idmap_path=idmap,
+                                    sermon_root=_sermon_root)
         ret_status = "Retriever: loaded"
     except Exception as e:
         ret_status = f"Retriever ERROR: {e}"
@@ -582,7 +585,8 @@ def process_new_files(folder: str) -> tuple[str, str]:
         from app.retriever import load_retriever
         global _retriever
         _retriever = load_retriever(
-            db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH
+            db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH,
+            sermon_root=folder.strip(),
         )
         raw += "Retriever reloaded successfully.\n"
     except Exception as e:
@@ -614,7 +618,8 @@ def full_rebuild(folder: str) -> tuple[str, str]:
         from app.retriever import load_retriever
         global _retriever
         _retriever = load_retriever(
-            db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH
+            db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH,
+            sermon_root=folder,
         )
         raw += "Retriever reloaded successfully.\n"
     except Exception as e:
