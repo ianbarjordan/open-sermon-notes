@@ -609,3 +609,111 @@ def test_browse_folder_windows_cancelled():
         mock_run.return_value = mock.MagicMock(returncode=0, stdout='')
         result = app_module.browse_folder()
     assert result == ''
+
+
+# ---------------------------------------------------------------------------
+# Quarantine handlers
+# ---------------------------------------------------------------------------
+
+def _setup_quarantine(tmp_path, buckets: dict[str, list[str]]) -> Path:
+    """Create a quarantine directory tree under tmp_path."""
+    root = tmp_path / "raw" / "quarantine"
+    for reason, files in buckets.items():
+        bucket = root / reason
+        bucket.mkdir(parents=True)
+        for fname in files:
+            (bucket / fname).write_text("dummy content")
+    return root
+
+
+def test_list_quarantine_returns_buckets(tmp_path):
+    root = _setup_quarantine(tmp_path, {
+        'manual_review': ['a.doc', 'b.doc'],
+        'duplicates': ['c.docx'],
+    })
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.list_quarantine()
+    assert set(result.keys()) == {'manual_review', 'duplicates'}
+    assert set(result['manual_review']) == {'a.doc', 'b.doc'}
+
+
+def test_list_quarantine_sorted_by_count(tmp_path):
+    root = _setup_quarantine(tmp_path, {
+        'too_short': ['x.docx'],
+        'duplicates': ['a.docx', 'b.docx', 'c.docx'],
+        'non_faith': ['d.docx', 'e.docx'],
+    })
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.list_quarantine()
+    counts = [len(v) for v in result.values()]
+    assert counts == sorted(counts, reverse=True)
+
+
+def test_list_quarantine_empty_root(tmp_path):
+    missing = tmp_path / "raw" / "quarantine"
+    with mock.patch.object(app_module, '_quarantine_root', return_value=missing):
+        result = app_module.list_quarantine()
+    assert result == {}
+
+
+def test_list_quarantine_skips_empty_buckets(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    (root / "empty_bucket").mkdir(parents=True)
+    (root / "non_faith").mkdir(parents=True)
+    (root / "non_faith" / "sermon.docx").write_text("content")
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.list_quarantine()
+    assert 'empty_bucket' not in result
+    assert 'non_faith' in result
+
+
+def test_ignore_quarantine_file_removes_file(tmp_path):
+    root = _setup_quarantine(tmp_path, {'duplicates': ['dup.docx']})
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.ignore_quarantine_file('duplicates', 'dup.docx')
+    assert not (root / 'duplicates' / 'dup.docx').exists()
+    assert 'ignored' in result.lower() or 'removed' in result.lower()
+
+
+def test_ignore_quarantine_file_already_gone(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    root.mkdir(parents=True)
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.ignore_quarantine_file('duplicates', 'ghost.docx')
+    assert 'already' in result.lower() or 'removed' in result.lower()
+
+
+def test_get_quarantine_summary_no_files(tmp_path):
+    missing = tmp_path / "raw" / "quarantine"
+    with mock.patch.object(app_module, '_quarantine_root', return_value=missing):
+        result = app_module.get_quarantine_summary()
+    assert 'no files' in result.lower() or 'everything' in result.lower()
+
+
+def test_get_quarantine_summary_with_files(tmp_path):
+    root = _setup_quarantine(tmp_path, {
+        'manual_review': ['a.doc', 'b.doc'],
+        'duplicates': ['c.docx'],
+    })
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.get_quarantine_summary()
+    assert '3' in result   # total
+    assert '2' in result   # manual_review count
+
+
+def test_force_ingest_file_no_library(tmp_path):
+    root = _setup_quarantine(tmp_path, {'manual_review': ['sermon.doc']})
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root), \
+         mock.patch.object(app_module, 'load_settings', return_value={'sermon_library_folder': ''}):
+        result = app_module.force_ingest_file('manual_review', 'sermon.doc')
+    assert 'not set' in result.lower() or 'library' in result.lower()
+
+
+def test_force_ingest_file_missing_from_quarantine(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    root.mkdir(parents=True)
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root), \
+         mock.patch.object(app_module, 'load_settings',
+                           return_value={'sermon_library_folder': str(tmp_path)}):
+        result = app_module.force_ingest_file('manual_review', 'ghost.doc')
+    assert 'not found' in result.lower()

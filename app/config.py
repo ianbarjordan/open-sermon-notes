@@ -55,3 +55,16 @@ FAISS_PATH          = "data/sermons.faiss"
 ID_MAP_PATH         = "data/id_map.json"
 DOCUMENTS_DIR       = "data/documents"
 SETTINGS_PATH       = "data/settings.json"
+QUARANTINE_ROOT     = "raw/quarantine"
+
+# Human-readable labels for each quarantine reason bucket
+QUARANTINE_LABELS: dict[str, str] = {
+    'manual_review':    'Blocked by Word security (.doc files)',
+    'duplicates':       'Duplicate files',
+    'non_faith':        'Not faith-related content',
+    'too_short':        'Too short to index',
+    'worship_slides':   'Worship / song slides',
+    'sparse_pptx':      'Sparse PowerPoint',
+    'filename_flagged': 'Flagged filename',
+    'format_pub':       'Publisher format (.pub)',
+}

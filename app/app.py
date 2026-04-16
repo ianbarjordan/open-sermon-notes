@@ -21,6 +21,8 @@ from app.config import (  # noqa: E402
     LOW_CONFIDENCE_THRESHOLD,
     MAX_TOP_K,
     MODEL_PATH,
+    QUARANTINE_LABELS,
+    QUARANTINE_ROOT,
     SETTINGS_PATH,
     TOP_K,
 )
@@ -631,6 +633,142 @@ def full_rebuild(folder: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Quarantine management handlers
+# ---------------------------------------------------------------------------
+
+def _quarantine_root() -> Path:
+    return Path(_PROJECT_ROOT) / QUARANTINE_ROOT
+
+
+def list_quarantine() -> dict[str, list[str]]:
+    """Return {reason: [filename, ...]} for every file in every quarantine bucket.
+
+    Keys are ordered by descending file count so the most important bucket
+    (manual_review) is always first in the UI.
+    """
+    root = _quarantine_root()
+    buckets: dict[str, list[str]] = {}
+    if not root.exists():
+        return buckets
+    for sub in sorted(root.iterdir()):
+        if sub.is_dir():
+            files = sorted(f.name for f in sub.iterdir() if f.is_file())
+            if files:
+                buckets[sub.name] = files
+    # Sort by descending count
+    return dict(sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True))
+
+
+def ignore_quarantine_file(reason: str, filename: str) -> str:
+    """Permanently delete a file from its quarantine bucket (mark as ignored)."""
+    p = _quarantine_root() / reason / filename
+    if not p.exists():
+        return f"Already removed: {filename}"
+    try:
+        p.unlink()
+        return f"Ignored and removed: {filename}"
+    except Exception as e:
+        get_logger(__name__).error("Could not remove quarantine file %s: %s", p, e)
+        return f"Error removing {filename}: {e}"
+
+
+def force_ingest_file(reason: str, filename: str) -> str:
+    """Move a quarantined file into the user's sermon library folder and re-ingest it.
+
+    For manual_review (.doc) files this also runs Unblock-File first so Word
+    COM can open them.  For all other reasons the file is simply moved to the
+    library root and processed via --force.
+    """
+    _log = get_logger(__name__)
+    src = _quarantine_root() / reason / filename
+    if not src.exists():
+        return f"File not found in quarantine: {filename}"
+
+    settings = load_settings()
+    library = settings.get('sermon_library_folder', '').strip()
+    if not library or not Path(library).is_dir():
+        return (
+            "Sermon library folder is not set or does not exist. "
+            "Set it on the Manage Archive tab first."
+        )
+
+    dest = Path(library) / filename
+    # Avoid clobbering an existing file
+    if dest.exists():
+        stem = src.stem
+        suffix = src.suffix
+        dest = Path(library) / f"{stem}_recovered{suffix}"
+
+    try:
+        import shutil
+        shutil.copy2(str(src), str(dest))
+    except Exception as e:
+        _log.error("Could not copy %s → %s: %s", src, dest, e)
+        return f"Could not copy file: {e}"
+
+    lines = [f"Copied {filename} → {dest.name}"]
+
+    # Unblock on Windows before ingest (critical for .doc files)
+    if sys.platform == 'win32':
+        unblock_result = _run_subprocess([
+            'powershell', '-NonInteractive', '-Command',
+            f'Unblock-File -Path "{dest}"',
+        ])
+        if 'error' in unblock_result.lower():
+            lines.append(f"Unblock warning: {unblock_result.strip()}")
+        else:
+            lines.append("Unblocked successfully.")
+
+    # Re-ingest just this one file using the library as source
+    raw = _run_subprocess([
+        sys.executable, "build/01_ingest_files.py",
+        "--source", library, "--force", "--verbose",
+        "--limit", "0",   # no limit — but only new/forced files are touched
+    ])
+    lines.append("\n--- Ingest output ---")
+    lines.append(raw.strip())
+
+    # Incremental embed
+    raw2 = _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--incremental"])
+    lines.append("\n--- Embed output ---")
+    lines.append(raw2.strip())
+
+    # Reload retriever
+    try:
+        from app.retriever import load_retriever
+        global _retriever
+        _retriever = load_retriever(
+            db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH,
+            sermon_root=library,
+        )
+        lines.append("\nRetriever reloaded.")
+    except Exception as e:
+        lines.append(f"\nRetriever reload failed: {e}")
+
+    # Remove from quarantine now that it's been processed
+    try:
+        src.unlink()
+        lines.append(f"Removed from quarantine/{reason}/.")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+
+def get_quarantine_summary() -> str:
+    """Return a Markdown summary of quarantine bucket counts."""
+    buckets = list_quarantine()
+    if not buckets:
+        return "_No files in quarantine — everything has been processed._"
+    total = sum(len(v) for v in buckets.values())
+    lines = [f"**{total} file(s) in quarantine** across {len(buckets)} bucket(s).\n"]
+    for reason, files in buckets.items():
+        label = QUARANTINE_LABELS.get(reason, reason)
+        lines.append(f"- **{label}**: {len(files)} file(s)")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
 
@@ -785,6 +923,93 @@ def build_ui():
                 results_df.select(fn=on_row_select, inputs=[chunks_state], outputs=[open_status])
                 # Reliable fallback: Row number input + button
                 open_btn.click(fn=open_file, inputs=[result_num, chunks_state], outputs=[open_status])
+
+            # ----------------------------------------------------------------
+            # Quarantine tab
+            # ----------------------------------------------------------------
+            with gr.Tab("⚠️  Quarantine"):
+
+                gr.HTML("""
+                    <h3 style="font-family:Georgia,serif;font-weight:normal;
+                               color:#3b2a1e;margin:0.5rem 0 0.25rem">
+                        Quarantined Files
+                    </h3>
+                """)
+                gr.Markdown(
+                    "These files were set aside during indexing. "
+                    "You can **Force Ingest** a file to move it into your library and index it, "
+                    "or **Ignore** it to remove it from this list permanently.",
+                    elem_classes=["status-hint"],
+                )
+
+                with gr.Row():
+                    quarantine_refresh_btn = gr.Button("🔄  Refresh", variant="secondary", scale=1)
+                    quarantine_summary_md = gr.Markdown(
+                        value=get_quarantine_summary(), scale=4
+                    )
+
+                gr.HTML("<hr class='archive-divider'>")
+
+                quarantine_action_md = gr.Markdown(value="")
+
+                # One accordion per quarantine bucket, populated at render time
+                _buckets = list_quarantine()
+                for _reason, _files in _buckets.items():
+                    _label = QUARANTINE_LABELS.get(_reason, _reason)
+                    _count = len(_files)
+                    with gr.Accordion(
+                        f"{_label}  ({_count} file{'s' if _count != 1 else ''})",
+                        open=(_reason == 'manual_review'),
+                    ):
+                        if _reason == 'manual_review':
+                            gr.Markdown(
+                                "💡 These `.doc` files are blocked by Windows security. "
+                                "**Force Ingest** will unblock and index the file. "
+                                "Or run **Unblock Sermon Library** on the Manage Archive tab "
+                                "to unblock all files at once, then Process New Files.",
+                                elem_classes=["status-hint"],
+                            )
+
+                        # Show up to 200 files per bucket to keep the UI responsive
+                        _visible = _files[:200]
+                        if len(_files) > 200:
+                            gr.Markdown(
+                                f"_Showing first 200 of {len(_files)} files. "
+                                "Unblock + Process New Files is the fastest way to handle large batches._",
+                                elem_classes=["status-hint"],
+                            )
+
+                        for _fname in _visible:
+                            with gr.Row():
+                                gr.Textbox(
+                                    value=_fname, interactive=False, show_label=False,
+                                    scale=5, lines=1, max_lines=1,
+                                )
+                                _fi_btn = gr.Button(
+                                    "➕ Force Ingest", scale=1, variant="primary",
+                                    size="sm",
+                                )
+                                _ig_btn = gr.Button(
+                                    "✕ Ignore", scale=1, variant="secondary",
+                                    size="sm",
+                                )
+                                # Capture loop vars in closures
+                                _fi_btn.click(
+                                    fn=lambda r=_reason, f=_fname: force_ingest_file(r, f),
+                                    inputs=[],
+                                    outputs=[quarantine_action_md],
+                                )
+                                _ig_btn.click(
+                                    fn=lambda r=_reason, f=_fname: ignore_quarantine_file(r, f),
+                                    inputs=[],
+                                    outputs=[quarantine_action_md],
+                                )
+
+                quarantine_refresh_btn.click(
+                    fn=get_quarantine_summary,
+                    inputs=[],
+                    outputs=[quarantine_summary_md],
+                )
 
             # ----------------------------------------------------------------
             # Manage Archive tab
