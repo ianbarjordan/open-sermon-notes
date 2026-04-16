@@ -176,27 +176,44 @@ def test_on_row_select_missing_source():
     assert 'not available' in result.lower() or 'no' in result.lower()
 
 
-def test_on_row_select_file_not_on_disk():
-    chunks = [{'source_file': '/nonexistent/path/Sermon.docx', 'title': 'Test'}]
+def test_on_row_select_file_not_on_disk(tmp_path):
+    # Use a path that is guaranteed not to exist (rather than a Unix absolute path,
+    # which resolves differently on Windows)
+    missing = tmp_path / "does_not_exist" / "Sermon.docx"
+    chunks = [{'source_file': str(missing), 'title': 'Test'}]
     evt = _make_select_event(0)
     result = app_module.on_row_select(evt, chunks)
     assert 'not found' in result.lower() or 'could not' in result.lower()
 
 
-def test_on_row_select_opens_file(tmp_path):
-    # Create a real temporary file so path.exists() passes
+def test_on_row_select_opens_file_linux(tmp_path):
+    """Non-Windows path: uses subprocess.run(['xdg-open', ...])."""
     tmp_file = tmp_path / "Sermon Test.docx"
     tmp_file.write_text("test content")
-
     chunks = [{'source_file': str(tmp_file), 'title': 'Test'}]
     evt = _make_select_event(0)
 
-    # Patch the platform-specific open call
     with mock.patch('subprocess.run') as mock_run, \
          mock.patch('sys.platform', 'linux'):
         mock_run.return_value = mock.MagicMock(returncode=0)
         result = app_module.on_row_select(evt, chunks)
 
+    assert 'Opened' in result
+    assert 'Sermon Test.docx' in result
+
+
+def test_on_row_select_opens_file_windows(tmp_path):
+    """Windows path: uses os.startfile, NOT subprocess."""
+    tmp_file = tmp_path / "Sermon Test.docx"
+    tmp_file.write_text("test content")
+    chunks = [{'source_file': str(tmp_file), 'title': 'Test'}]
+    evt = _make_select_event(0)
+
+    with mock.patch('os.startfile') as mock_startfile, \
+         mock.patch('sys.platform', 'win32'):
+        result = app_module.on_row_select(evt, chunks)
+
+    mock_startfile.assert_called_once()
     assert 'Opened' in result
     assert 'Sermon Test.docx' in result
 
@@ -227,12 +244,253 @@ def test_run_subprocess_nonzero_exit():
 # ---------------------------------------------------------------------------
 
 def test_process_new_files_empty_folder():
-    # Returns (summary, raw_log) tuple since Tier 1 refactor
     summary, _ = app_module.process_new_files("")
     assert 'enter' in summary.lower() or 'please' in summary.lower()
 
 
 def test_full_rebuild_empty_folder():
-    # Returns (summary, raw_log) tuple since Tier 1 refactor
     summary, _ = app_module.full_rebuild("")
     assert 'enter' in summary.lower() or 'please' in summary.lower()
+
+
+def test_process_new_files_invalid_path(tmp_path):
+    """Non-existent directory returns a user-friendly error, not an exception."""
+    bad_path = str(tmp_path / "does_not_exist")
+    summary, raw = app_module.process_new_files(bad_path)
+    assert 'not found' in summary.lower() or 'check' in summary.lower()
+    assert raw == ""
+
+
+def test_full_rebuild_invalid_path(tmp_path):
+    bad_path = str(tmp_path / "does_not_exist")
+    summary, raw = app_module.full_rebuild(bad_path)
+    assert 'not found' in summary.lower() or 'check' in summary.lower()
+    assert raw == ""
+
+
+# ---------------------------------------------------------------------------
+# open_file (number-input fallback handler)
+# ---------------------------------------------------------------------------
+
+def test_open_file_no_results():
+    result = app_module.open_file(1, [])
+    assert 'no search' in result.lower() or 'run a search' in result.lower()
+
+
+def test_open_file_out_of_range():
+    chunks = _make_chunks(2)
+    result = app_module.open_file(5, chunks)
+    assert 'does not exist' in result.lower() or 'result' in result.lower()
+
+
+def test_open_file_missing_source():
+    chunks = [{'source_file': '', 'title': 'Test'}]
+    result = app_module.open_file(1, chunks)
+    assert 'no file' in result.lower() or 'path' in result.lower()
+
+
+def test_open_file_file_not_on_disk(tmp_path):
+    missing = tmp_path / "nope" / "Sermon.docx"
+    chunks = [{'source_file': str(missing), 'title': 'Test'}]
+    result = app_module.open_file(1, chunks)
+    assert 'not found' in result.lower()
+
+
+def test_open_file_opens_on_linux(tmp_path):
+    tmp_file = tmp_path / "Grace.docx"
+    tmp_file.write_text("content")
+    chunks = [{'source_file': str(tmp_file), 'title': 'Test'}]
+
+    with mock.patch('subprocess.run') as mock_run, \
+         mock.patch('sys.platform', 'linux'):
+        mock_run.return_value = mock.MagicMock(returncode=0)
+        result = app_module.open_file(1, chunks)
+
+    assert 'Opened' in result
+    assert 'Grace.docx' in result
+
+
+def test_open_file_opens_on_windows(tmp_path):
+    """Windows path: must call os.startfile, not subprocess."""
+    tmp_file = tmp_path / "Grace.docx"
+    tmp_file.write_text("content")
+    chunks = [{'source_file': str(tmp_file), 'title': 'Test'}]
+
+    with mock.patch('os.startfile') as mock_startfile, \
+         mock.patch('sys.platform', 'win32'):
+        result = app_module.open_file(1, chunks)
+
+    mock_startfile.assert_called_once()
+    assert 'Opened' in result
+
+
+# ---------------------------------------------------------------------------
+# load_settings / save_settings
+# ---------------------------------------------------------------------------
+
+def test_settings_roundtrip(tmp_path, monkeypatch):
+    """save_settings then load_settings returns the same dict."""
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(app_module, '_settings_path', lambda: settings_file)
+
+    app_module.save_settings({'sermon_library_folder': r'C:\Sermons'})
+    loaded = app_module.load_settings()
+    assert loaded['sermon_library_folder'] == r'C:\Sermons'
+
+
+def test_load_settings_missing_file(tmp_path, monkeypatch):
+    """Missing settings file returns empty dict, not an error."""
+    monkeypatch.setattr(app_module, '_settings_path',
+                        lambda: tmp_path / "nonexistent.json")
+    assert app_module.load_settings() == {}
+
+
+def test_save_settings_creates_parent(tmp_path, monkeypatch):
+    deep = tmp_path / "a" / "b" / "settings.json"
+    monkeypatch.setattr(app_module, '_settings_path', lambda: deep)
+    app_module.save_settings({'key': 'value'})
+    assert deep.exists()
+
+
+# ---------------------------------------------------------------------------
+# _parse_ingest_counts
+# ---------------------------------------------------------------------------
+
+_SAMPLE_INGEST_LOG = """
+Found 253 files in 'SampleData'
+Platform: Windows
+
+--- Ingest Summary ---
+  accepted                  153
+  skipped                    21
+  too_short                  19
+  non_faith                  18
+  filename_flagged           15
+  format_pub                 13
+  manual_review              10
+  worship_slides              3
+  duplicates                  1
+  TOTAL                     253
+"""
+
+
+def test_parse_ingest_counts_accepted():
+    counts = app_module._parse_ingest_counts(_SAMPLE_INGEST_LOG)
+    assert counts['accepted'] == 153
+
+
+def test_parse_ingest_counts_manual_review():
+    counts = app_module._parse_ingest_counts(_SAMPLE_INGEST_LOG)
+    assert counts['manual_review'] == 10
+
+
+def test_parse_ingest_counts_total_ignored():
+    """TOTAL line should not appear as a count key."""
+    counts = app_module._parse_ingest_counts(_SAMPLE_INGEST_LOG)
+    assert 'TOTAL' not in counts
+
+
+def test_parse_ingest_counts_empty_log():
+    assert app_module._parse_ingest_counts("no summary here") == {}
+
+
+# ---------------------------------------------------------------------------
+# _build_run_summary
+# ---------------------------------------------------------------------------
+
+def test_build_run_summary_success():
+    summary = app_module._build_run_summary(_SAMPLE_INGEST_LOG)
+    assert '153' in summary
+    assert '✅' in summary
+
+
+def test_build_run_summary_word_blocked():
+    log = _SAMPLE_INGEST_LOG + "\nWord blocked by administrator\n[exit code: 1]"
+    summary = app_module._build_run_summary(log)
+    assert '⚠️' in summary
+    assert 'word' in summary.lower() or 'unblock' in summary.lower()
+
+
+def test_build_run_summary_generic_exit_code():
+    summary = app_module._build_run_summary("some output\n[exit code: 1]")
+    assert '⚠️' in summary
+
+
+def test_build_run_summary_no_counts_no_error():
+    """No summary block, no error → generic completion message."""
+    summary = app_module._build_run_summary("", operation='Rebuild')
+    assert 'Rebuild' in summary or '✅' in summary
+
+
+# ---------------------------------------------------------------------------
+# unblock_library
+# ---------------------------------------------------------------------------
+
+def test_unblock_library_empty_folder():
+    summary, _ = app_module.unblock_library("")
+    assert 'enter' in summary.lower() or 'please' in summary.lower()
+
+
+def test_unblock_library_invalid_path(tmp_path):
+    bad = str(tmp_path / "missing")
+    summary, _ = app_module.unblock_library(bad)
+    assert 'not found' in summary.lower()
+
+
+def test_unblock_library_non_windows(tmp_path):
+    with mock.patch('sys.platform', 'linux'):
+        summary, _ = app_module.unblock_library(str(tmp_path))
+    assert 'windows' in summary.lower()
+
+
+def test_unblock_library_windows_success(tmp_path):
+    with mock.patch('sys.platform', 'win32'), \
+         mock.patch('subprocess.run') as mock_run:
+        mock_run.return_value = mock.MagicMock(
+            returncode=0, stdout="Done.\n", stderr=""
+        )
+        summary, raw = app_module.unblock_library(str(tmp_path))
+
+    assert '✅' in summary
+    assert 'process new files' in summary.lower() or 'retry' in summary.lower()
+
+
+def test_unblock_library_windows_failure(tmp_path):
+    with mock.patch('sys.platform', 'win32'), \
+         mock.patch('subprocess.run') as mock_run:
+        mock_run.return_value = mock.MagicMock(
+            returncode=1, stdout="", stderr="Access denied"
+        )
+        summary, raw = app_module.unblock_library(str(tmp_path))
+
+    assert '⚠️' in summary
+    assert 'access denied' in raw.lower()
+
+
+# ---------------------------------------------------------------------------
+# browse_folder
+# ---------------------------------------------------------------------------
+
+def test_browse_folder_non_windows():
+    with mock.patch('sys.platform', 'linux'):
+        result = app_module.browse_folder()
+    assert result == ''
+
+
+def test_browse_folder_windows_returns_path(tmp_path):
+    with mock.patch('sys.platform', 'win32'), \
+         mock.patch('subprocess.run') as mock_run:
+        mock_run.return_value = mock.MagicMock(
+            returncode=0, stdout=str(tmp_path)
+        )
+        result = app_module.browse_folder()
+    assert result == str(tmp_path)
+
+
+def test_browse_folder_windows_cancelled():
+    """User cancels dialog → empty string returned."""
+    with mock.patch('sys.platform', 'win32'), \
+         mock.patch('subprocess.run') as mock_run:
+        mock_run.return_value = mock.MagicMock(returncode=0, stdout='')
+        result = app_module.browse_folder()
+    assert result == ''

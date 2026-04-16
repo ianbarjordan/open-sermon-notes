@@ -316,7 +316,7 @@ def _parse_ingest_counts(raw_log: str) -> dict[str, int]:
             continue
         if in_summary:
             m = re.match(r'\s+(\w+)\s+(\d+)', line)
-            if m:
+            if m and m.group(1) != 'TOTAL':
                 counts[m.group(1)] = int(m.group(2))
     return counts
 
