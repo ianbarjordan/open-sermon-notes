@@ -1013,15 +1013,15 @@ def build_ui():
             with gr.Tab("🔍  Search"):
                 chunks_state = gr.State([])
 
-                # Full-width query box
+                # Full-width query box — single-line so Enter submits the search
                 query_box = gr.Textbox(
                     label="",
                     show_label=False,
-                    lines=2,
-                    max_lines=6,
+                    lines=1,
+                    max_lines=4,
                     placeholder=(
-                        "Ask about a topic, scripture, or season…\n"
-                        "e.g. 'forgiveness in the Psalms'  ·  'Advent 2012'  ·  'prodigal son'"
+                        "Ask about a topic, scripture, or season — press Enter to search  "
+                        "·  e.g. 'forgiveness in the Psalms'  ·  'Advent 2012'  ·  'prodigal son'"
                     ),
                 )
 
@@ -1249,6 +1249,13 @@ def build_ui():
                     )
                     if sys.platform == 'win32':
                         browse_btn = gr.Button("📁  Browse…", scale=1)
+
+                gr.Markdown(
+                    "⚠️  **Changing this path requires an app restart** to take full effect — "
+                    "the search index and file links are loaded once at startup. "
+                    "After restarting, click **Process New Files** to index the new library.",
+                    elem_classes=["status-hint"],
+                )
 
                 # ── Section: Update index ─────────────────────────────────
                 gr.HTML("<hr class='archive-divider'>")
