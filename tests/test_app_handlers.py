@@ -66,19 +66,60 @@ def test_handle_query_returns_rows():
 
     assert len(rows) == 3
     assert state == chunks
-    mock_retriever.search.assert_called_once_with("grace", top_k=5)
+    # Retriever is always called with MAX_TOP_K so auto-expansion has the full pool
+    from app.config import MAX_TOP_K
+    mock_retriever.search.assert_called_once_with("grace", top_k=MAX_TOP_K)
 
 
-def test_handle_query_passes_top_k():
-    chunks = _make_chunks(10)
+def test_handle_query_always_fetches_max_top_k():
+    """Slider value does not limit the retriever call — only the minimum shown."""
+    from app.config import MAX_TOP_K
+    chunks = _make_chunks(5)
     mock_retriever = mock.MagicMock()
     mock_retriever.search.return_value = chunks
-
     app_module._retriever = mock_retriever
     app_module._llm = None
 
-    _, _, _, _ = app_module.handle_query("forgiveness", 10)
-    mock_retriever.search.assert_called_once_with("forgiveness", top_k=10)
+    app_module.handle_query("forgiveness", top_k=3)
+    mock_retriever.search.assert_called_once_with("forgiveness", top_k=MAX_TOP_K)
+
+
+def test_handle_query_slider_sets_minimum():
+    """Slider value is the floor: results below AUTO_EXPAND_THRESHOLD beyond
+    the slider value are not included."""
+    from app.config import AUTO_EXPAND_THRESHOLD
+    # 5 chunks: first 2 above threshold, next 3 below
+    high = AUTO_EXPAND_THRESHOLD + 0.005
+    low  = AUTO_EXPAND_THRESHOLD - 0.005
+    chunks = (
+        _make_chunks(2, score=high) +
+        _make_chunks(3, score=low)
+    )
+    mock_retriever = mock.MagicMock()
+    mock_retriever.search.return_value = chunks
+    app_module._retriever = mock_retriever
+    app_module._llm = None
+
+    # Slider = 1 → base is 1, but 1 more is high-confidence → 2 total
+    _, rows, _, state = app_module.handle_query("grace", top_k=1)
+    assert len(rows) == 2
+    assert len(state) == 2
+
+
+def test_handle_query_auto_expand_status():
+    """Status line mentions auto-expansion when extra high-confidence results are added."""
+    from app.config import AUTO_EXPAND_THRESHOLD
+    high = AUTO_EXPAND_THRESHOLD + 0.005
+    chunks = _make_chunks(5, score=high)
+    mock_retriever = mock.MagicMock()
+    mock_retriever.search.return_value = chunks
+    app_module._retriever = mock_retriever
+    app_module._llm = None
+
+    # Slider = 2, but all 5 chunks are above AUTO_EXPAND_THRESHOLD
+    _, _, status, state = app_module.handle_query("grace", top_k=2)
+    assert len(state) == 5
+    assert 'additional' in status.lower() or '5' in status
 
 
 def test_handle_query_row_structure():

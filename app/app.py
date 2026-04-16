@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.config import (  # noqa: E402
+    AUTO_EXPAND_THRESHOLD,
     DB_PATH,
     FAISS_PATH,
     ID_MAP_PATH,
@@ -117,12 +118,23 @@ def handle_query(query: str, top_k: int = TOP_K):
         return ("Retriever is not available. Check startup logs.", [], "Error: retriever not loaded", [])
 
     try:
-        chunks = _retriever.search(query, top_k=int(top_k))
+        # Always fetch the full MAX_TOP_K pool so auto-expansion has candidates to draw from
+        all_chunks = _retriever.search(query, top_k=MAX_TOP_K)
     except Exception as e:
         return (f"Retrieval error: {e}", [], f"Error: {e}", [])
 
-    if not chunks:
+    if not all_chunks:
         return ("No relevant sermons found for this query.", [], "0 results", [])
+
+    # Auto-expand: always show at least top_k, plus any additional results that score
+    # above AUTO_EXPAND_THRESHOLD (≈70% match) up to MAX_TOP_K.
+    min_results = int(top_k)
+    base = all_chunks[:min_results]
+    expanded = [
+        c for c in all_chunks[min_results:]
+        if c.get('score', 0) >= AUTO_EXPAND_THRESHOLD
+    ]
+    chunks = base + expanded
 
     # Build answer via LLM (or fallback if LLM not loaded)
     if _llm is not None:
@@ -167,7 +179,14 @@ def handle_query(query: str, top_k: int = TOP_K):
             "Results shown are the closest matches available."
         )
     else:
-        status = f"{len(chunks)} result(s) returned"
+        n = len(chunks)
+        if n > min_results and expanded:
+            status = (
+                f"{n} result(s) — {len(expanded)} additional high-confidence match(es) "
+                f"included automatically"
+            )
+        else:
+            status = f"{n} result(s) returned"
 
     return answer, rows, status, chunks
 
@@ -619,7 +638,7 @@ def build_ui():
                         maximum=MAX_TOP_K,
                         value=TOP_K,
                         step=1,
-                        label="Results",
+                        label="Min. results",
                         scale=1,
                     )
 
@@ -639,7 +658,7 @@ def build_ui():
                     label="Source Chunks  (click a row to open the file)",
                     wrap=True,
                     elem_classes=["results-table"],
-                    row_count=(15, "fixed"),
+                    row_count=(MAX_TOP_K, "fixed"),
                 )
 
                 with gr.Row():

@@ -12,7 +12,22 @@ def test_max_top_k_exists():
 
 
 def test_max_top_k_value():
-    assert cfg.MAX_TOP_K == 15
+    assert cfg.MAX_TOP_K == 50
+
+
+def test_auto_expand_threshold_exists():
+    assert hasattr(cfg, 'AUTO_EXPAND_THRESHOLD')
+
+
+def test_auto_expand_threshold_above_low_confidence():
+    # Auto-expand threshold must be meaningfully above the low-confidence warning
+    # so auto-expansion only fires on genuinely strong matches
+    assert cfg.AUTO_EXPAND_THRESHOLD > cfg.LOW_CONFIDENCE_THRESHOLD
+
+
+def test_auto_expand_threshold_below_rrf_max():
+    rrf_max = 2.0 / (cfg.RRF_K + 1)
+    assert cfg.AUTO_EXPAND_THRESHOLD < rrf_max
 
 
 def test_top_k_less_than_max():

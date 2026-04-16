@@ -26,11 +26,18 @@ Last updated: 2026-04-15
 
 ## Tier 3 — Search UX + GUI polish
 
-### 10. Increase max search results  (`app/config.py`, `app/app.py`)
-- Raise `MAX_TOP_K` from 15 → **50** (covers the "30 or more" user request with headroom)
+### 10. Dynamic result count + raised ceiling  (`app/config.py`, `app/app.py`)
+- Raise `MAX_TOP_K` from 15 → **50**
 - Default `TOP_K` stays 5
-- Update `row_count` on the results dataframe to track `MAX_TOP_K` dynamically instead
-  of being hardcoded to 15
+- **Dynamic auto-expansion:** retriever always fetches `MAX_TOP_K` candidates; `handle_query`
+  returns at least `top_k` results, *plus* any additional results scoring ≥ 70% of the
+  theoretical RRF max — up to `MAX_TOP_K`. This way a high-confidence query naturally
+  surfaces all strong matches even if the user left the slider at 5.
+  - Add `AUTO_EXPAND_THRESHOLD = 0.023` to `app/config.py`
+    (= 70% × 2/61 ≈ 0.033; requires presence near the top of *both* dense and sparse lists)
+  - Rename slider label from "Results" → "Min. results" so the behaviour is self-describing
+- Update `row_count` on the results dataframe to `(MAX_TOP_K, "fixed")` so it tracks the
+  ceiling automatically
 - LLM context budget is unaffected — `_LLM_MAX_CHUNKS = 4` already caps what the model
   reads regardless of how many rows are shown in the table
 - Rationale for 50: RRF scores drop steeply past ~25, so results beyond that are
