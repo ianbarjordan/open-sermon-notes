@@ -227,10 +227,12 @@ def test_run_subprocess_nonzero_exit():
 # ---------------------------------------------------------------------------
 
 def test_process_new_files_empty_folder():
-    result = app_module.process_new_files("")
-    assert 'enter' in result.lower() or 'please' in result.lower()
+    # Returns (summary, raw_log) tuple since Tier 1 refactor
+    summary, _ = app_module.process_new_files("")
+    assert 'enter' in summary.lower() or 'please' in summary.lower()
 
 
 def test_full_rebuild_empty_folder():
-    result = app_module.full_rebuild("")
-    assert 'enter' in result.lower() or 'please' in result.lower()
+    # Returns (summary, raw_log) tuple since Tier 1 refactor
+    summary, _ = app_module.full_rebuild("")
+    assert 'enter' in summary.lower() or 'please' in summary.lower()
