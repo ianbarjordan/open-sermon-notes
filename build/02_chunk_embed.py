@@ -49,12 +49,14 @@ def load_documents(docs_dir: str) -> list[dict]:
 _CREATE_DOCUMENTS = """
 CREATE TABLE IF NOT EXISTS documents (
     doc_id        TEXT PRIMARY KEY,
+    sha256        TEXT NOT NULL,
     source_file   TEXT NOT NULL,
     title         TEXT,
     scripture_ref TEXT,
     date          TEXT,
     format        TEXT,
     word_count    INTEGER,
+    text          TEXT,
     ingested_at   TEXT DEFAULT (datetime('now'))
 );
 """
@@ -95,17 +97,19 @@ def insert_document_metadata(conn: sqlite3.Connection, doc: dict) -> None:
     conn.execute(
         """
         INSERT OR REPLACE INTO documents
-            (doc_id, source_file, title, scripture_ref, date, format, word_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (doc_id, sha256, source_file, title, scripture_ref, date, format, word_count, text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             doc['doc_id'],
+            doc.get('sha256', 'legacy_no_hash'),
             doc['source_file'],
             doc.get('title'),
             doc.get('scripture_ref'),
             doc.get('date'),
             doc.get('format'),
             doc.get('word_count'),
+            doc.get('text', ''),
         ),
     )
 
@@ -230,8 +234,28 @@ def build_index(docs: list[dict], model, conn: sqlite3.Connection, batch_size: i
     return index, id_map
 
 
+def _remove_stale_chunks(conn: sqlite3.Connection, doc_id: str, index, id_map: dict):
+    """
+    Remove chunks belonging to doc_id from FAISS (not easily possible with IndexFlatL2
+    without rebuild) and SQLite.
+
+    Since FAISS IndexFlatL2 doesn't support easy deletion by ID, 'incremental'
+    updates that modify existing documents will currently result in ORPHANED VECTORS
+    in FAISS unless we rebuild the index.
+
+    For v2 beta, if a hash mismatch occurs, we'll delete from SQLite and warn
+    the user that a Full Rebuild is recommended for optimal vector search.
+    """
+    conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+    # Also remove from id_map (marks slots as stale)
+    for pos, cid in list(id_map.items()):
+        if cid.startswith(f"{doc_id}::"):
+            del id_map[pos]
+
+
 def build_index_incremental(
     new_docs: list[dict],
+    stale_doc_ids: list[str],
     model,
     conn: sqlite3.Connection,
     existing_index,
@@ -240,18 +264,23 @@ def build_index_incremental(
 ) -> tuple:
     """Append-only update: embed new_docs and add to existing FAISS + FTS5.
 
-    Returns (updated_index, updated_id_map).
+    If stale_doc_ids is provided, these are removed from SQLite before adding.
     """
     import numpy as np
 
-    offset = existing_index.ntotal
     id_map = dict(existing_id_map)
 
+    if stale_doc_ids:
+        print(f"Removing {len(stale_doc_ids)} stale documents from SQLite...")
+        for did in stale_doc_ids:
+            _remove_stale_chunks(conn, did, existing_index, id_map)
+
+    offset = existing_index.ntotal
     all_texts: list[str] = []
     all_chunk_ids: list[str] = []
     chunk_docs: list[dict] = []
 
-    print(f"Chunking {len(new_docs)} new documents...")
+    print(f"Chunking {len(new_docs)} new/updated documents...")
     for doc in new_docs:
         text = doc.get('text', '')
         if not text:
@@ -266,7 +295,7 @@ def build_index_incremental(
     print(f"New chunks: {len(all_texts)}")
 
     if not all_texts:
-        print("No new chunks to embed. Index is already up to date.")
+        print("No new chunks to embed.")
         return existing_index, id_map
 
     print(f"Embedding with {EMBED_MODEL} (batch={batch_size})...")
@@ -296,32 +325,17 @@ def build_index_incremental(
     for i, chunk_id in enumerate(all_chunk_ids):
         id_map[offset + i] = chunk_id
 
-    # Insert into SQLite (INSERT OR IGNORE for documents, plain insert for chunks)
+    # Insert into SQLite
     print("Writing new chunks to SQLite FTS5...")
     seen_docs: set = set()
     for chunk_id, chunk_text, doc in zip(all_chunk_ids, all_texts, chunk_docs):
         if doc['doc_id'] not in seen_docs:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO documents
-                    (doc_id, source_file, title, scripture_ref, date, format, word_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    doc['doc_id'],
-                    doc['source_file'],
-                    doc.get('title'),
-                    doc.get('scripture_ref'),
-                    doc.get('date'),
-                    doc.get('format'),
-                    doc.get('word_count'),
-                ),
-            )
+            insert_document_metadata(conn, doc)
             seen_docs.add(doc['doc_id'])
         insert_chunk_fts(conn, chunk_id, doc, chunk_text)
 
     conn.commit()
-    print(f"SQLite: +{len(seen_docs)} new documents, +{len(all_texts)} new chunks")
+    print(f"SQLite: +{len(seen_docs)} docs (new/updated), +{len(all_texts)} new chunks")
 
     return existing_index, id_map
 
@@ -406,13 +420,25 @@ def main() -> None:
 
             conn = init_db(args.db, force=False)
 
-            # Find doc_ids already in DB
-            existing_ids = {
-                row[0]
-                for row in conn.execute("SELECT doc_id FROM documents").fetchall()
+            # Find doc_ids + hashes already in DB
+            db_registry = {
+                row[0]: row[1]
+                for row in conn.execute("SELECT doc_id, sha256 FROM documents").fetchall()
             }
-            new_docs = [d for d in docs if d['doc_id'] not in existing_ids]
-            print(f"Already indexed: {len(existing_ids)} docs. New docs: {len(new_docs)}")
+            
+            new_docs = []
+            stale_doc_ids = []
+            
+            for d in docs:
+                did = d['doc_id']
+                if did not in db_registry:
+                    new_docs.append(d)
+                elif d.get('sha256', '') != db_registry[did]:
+                    new_docs.append(d)
+                    stale_doc_ids.append(did)
+            
+            print(f"Already indexed: {len(db_registry)} docs.")
+            print(f"New/Updated docs: {len(new_docs)} ({len(stale_doc_ids)} modified)")
 
             if not new_docs:
                 print("Index is already up to date. Nothing to add.")
@@ -420,7 +446,7 @@ def main() -> None:
                 return
 
             index, id_map = build_index_incremental(
-                new_docs, model, conn, existing_index, existing_id_map, args.batch
+                new_docs, stale_doc_ids, model, conn, existing_index, existing_id_map, args.batch
             )
 
         save_artifacts(index, id_map, args.faiss, args.idmap)

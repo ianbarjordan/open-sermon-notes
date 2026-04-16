@@ -51,6 +51,7 @@ def _make_index(n_vectors: int = 0) -> 'faiss.IndexFlatL2':
 def _make_doc(doc_id: str) -> dict:
     return {
         'doc_id':        doc_id,
+        'sha256':        f'hash_{doc_id}',
         'source_file':   f'SampleData/{doc_id}.docx',
         'title':         f'Sermon {doc_id}',
         'scripture_ref': 'John 3:16',
@@ -97,7 +98,7 @@ def test_init_db_force_drops_existing():
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = str(Path(tmpdir) / "test.db")
         conn = init_db(db_path)
-        conn.execute("INSERT INTO documents (doc_id, source_file) VALUES ('x','y')")
+        conn.execute("INSERT INTO documents (doc_id, sha256, source_file) VALUES ('x','h','y')")
         conn.commit()
         conn.close()
 
@@ -155,7 +156,7 @@ def test_incremental_adds_new_docs():
         model = _MockModel()
 
         updated_index, updated_id_map = build_index_incremental(
-            [new_doc], model, conn, existing_index, existing_id_map, batch_size=8
+            [new_doc], [], model, conn, existing_index, existing_id_map, batch_size=8
         )
 
         # FAISS should have more vectors than before
@@ -182,7 +183,7 @@ def test_incremental_no_new_docs_is_noop():
 
         # Pass empty new_docs list
         updated_index, updated_id_map = build_index_incremental(
-            [], model, conn, existing_index, existing_id_map, batch_size=8
+            [], [], model, conn, existing_index, existing_id_map, batch_size=8
         )
 
         assert updated_index.ntotal == 0
@@ -205,7 +206,7 @@ def test_incremental_id_map_offset():
         model = _MockModel()
 
         _, updated_id_map = build_index_incremental(
-            [new_doc], model, conn, existing_index, existing_id_map, batch_size=8
+            [new_doc], [], model, conn, existing_index, existing_id_map, batch_size=8
         )
 
         new_keys = [k for k in updated_id_map if k >= offset]

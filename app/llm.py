@@ -92,22 +92,28 @@ class LLM:
         temperature: float = 0.1,
         stream: bool = False,
     ) -> str:
-        """Generate an answer from the given query and chunk context.
-
-        stream=False only in v1.
-        """
+        """Generate an answer from the given query and chunk context."""
         user_message = _build_user_message(query, chunks)
+        # Adding a trailing "Answer:" to the user message to nudge the model 
+        # into a direct response and avoid few-shot hallucinations.
         messages = [
             {'role': 'system', 'content': _SYSTEM_PROMPT},
-            {'role': 'user',   'content': user_message},
+            {'role': 'user',   'content': user_message + "\n\nAnswer:"},
         ]
         response = self._llama.create_chat_completion(
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
             stream=False,
+            # Explicitly stop before the model tries to hallucinate 
+            # new questions or repeats instructions.
+            stop=["<|user|>", "<|system|>", "<|end|>", "Question:", "---"],
         )
-        return response['choices'][0]['message']['content'].strip()
+        content = response['choices'][0]['message']['content'].strip()
+        # Strip any redundant "Answer:" prefix the model might have echoed
+        if content.startswith("Answer:"):
+            content = content[len("Answer:"):].strip()
+        return content
 
 
 # ---------------------------------------------------------------------------

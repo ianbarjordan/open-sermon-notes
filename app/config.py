@@ -1,6 +1,11 @@
 import os
 
 # ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+BUILD_VERSION       = "pre-production-v1.0.1"
+
+# ---------------------------------------------------------------------------
 # Embedding
 # ---------------------------------------------------------------------------
 EMBED_MODEL         = "BAAI/bge-small-en-v1.5"
@@ -40,6 +45,11 @@ COMMENTARY_CHUNK_WORDS   = 150  # Target size for commentary/exposition chunks
 # ---------------------------------------------------------------------------
 # Paths  (all relative to project root — never hardcode absolute paths)
 # ---------------------------------------------------------------------------
+# SERMON_ROOT is the base directory for the user's raw sermon files (.doc, .docx).
+# When shipping the "Pre-Computed Search Bundle", source_file paths in the
+# database should be stored RELATIVE to this root to ensure portability.
+SERMON_ROOT         = "SampleData" 
+
 DB_PATH             = "data/sermons.db"
 FAISS_PATH          = "data/sermons.faiss"
 ID_MAP_PATH         = "data/id_map.json"

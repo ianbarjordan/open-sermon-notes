@@ -414,6 +414,7 @@ def ingest_file(
     out_dir: str,
     quarantine_root: str,
     seen_hashes: set,
+    source_root_path: Path,
     dry_run: bool = False,
     force: bool = False,
     verbose: bool = False,
@@ -503,9 +504,9 @@ def ingest_file(
         quarantine(path, 'non_faith', quarantine_root, dry_run)
         return 'non_faith'
 
-    # Step 9: Duplicate check
+    # Step 9: Duplicate check (skip if --force is used to allow re-processing)
     sha = compute_sha256(path)
-    if sha in seen_hashes:
+    if not force and sha in seen_hashes:
         if verbose:
             print(f"  DUP     {path.name}")
         quarantine(path, 'duplicates', quarantine_root, dry_run)
@@ -518,11 +519,19 @@ def ingest_file(
     meta = parse_filename(stem)
     doc_id = make_doc_id(stem)
 
-    # Store as POSIX path (forward slashes) for cross-platform consistency
-    source_file = path.as_posix()
+    # Store source_file as a RELATIVE path to the source root for portability.
+    # On Windows, this ensures it works regardless of the drive letter/base path.
+    # We resolve the absolute path then compute relative to the provided --source.
+    source_root = Path(source_root_path).resolve()
+    try:
+        source_file = path.resolve().relative_to(source_root).as_posix()
+    except ValueError:
+        # Fallback if path is outside source root (unlikely but possible)
+        source_file = path.as_posix()
 
     doc = {
         'doc_id':        doc_id,
+        'sha256':        sha,
         'source_file':   source_file,
         'title':         meta.get('title'),
         'scripture_ref': meta.get('scripture_ref'),
@@ -604,6 +613,7 @@ def main() -> None:
                 out_dir=args.out,
                 quarantine_root=args.quarantine,
                 seen_hashes=seen_hashes,
+                source_root_path=Path(args.source),
                 dry_run=args.dry_run,
                 force=args.force,
                 verbose=args.verbose,
