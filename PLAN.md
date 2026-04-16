@@ -2,6 +2,7 @@
 
 Pre-packaging refinement tasks, ordered by priority.
 Last updated: 2026-04-15
+Next session: start with item 11 (GUI analysis and redesign)
 
 ---
 
@@ -24,9 +25,9 @@ Last updated: 2026-04-15
 
 ---
 
-## Tier 3 — Search UX + GUI polish
+## Tier 3 — Search UX + GUI polish  (partially complete)
 
-### 10. Dynamic result count + raised ceiling  (`app/config.py`, `app/app.py`)
+### 10. Dynamic result count + raised ceiling  ✅  (`app/config.py`, `app/app.py`)
 - Raise `MAX_TOP_K` from 15 → **50**
 - Default `TOP_K` stays 5
 - **Dynamic auto-expansion:** retriever always fetches `MAX_TOP_K` candidates; `handle_query`
