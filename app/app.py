@@ -3,9 +3,10 @@ app.py — Gradio UI for AI-Powered Sermon Note Search.
 
 Usage:
     python app/app.py --port 7860
-    python app/app.py --host 0.0.0.0 --port 7860 --share
+    python app/app.py --host 127.0.0.1 --port 7861
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -19,8 +20,10 @@ from app.config import (  # noqa: E402
     LOW_CONFIDENCE_THRESHOLD,
     MAX_TOP_K,
     MODEL_PATH,
+    SETTINGS_PATH,
     TOP_K,
 )
+from app.logging_config import get_logger, log_dir, setup_logging  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Global retriever + LLM (loaded once at startup)
@@ -32,6 +35,35 @@ _llm = None
 _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
+# ---------------------------------------------------------------------------
+# Persistent settings (data/settings.json)
+# ---------------------------------------------------------------------------
+
+def _settings_path() -> Path:
+    return Path(_PROJECT_ROOT) / SETTINGS_PATH
+
+
+def load_settings() -> dict:
+    p = _settings_path()
+    if p.exists():
+        try:
+            with open(p, encoding='utf-8') as fh:
+                return json.load(fh)
+        except Exception:
+            pass
+    return {}
+
+
+def save_settings(settings: dict) -> None:
+    p = _settings_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(p, 'w', encoding='utf-8') as fh:
+            json.dump(settings, fh, indent=2)
+    except Exception:
+        pass
+
+
 def _load_components(
     db: str,
     faiss: str,
@@ -40,6 +72,7 @@ def _load_components(
 ) -> tuple[str, str]:
     """Load retriever and LLM; return (retriever_status, llm_status)."""
     global _retriever, _llm
+    _log = get_logger(__name__)
 
     ret_status = "Retriever: not loaded"
     llm_status = "LLM: not loaded"
@@ -50,7 +83,7 @@ def _load_components(
         ret_status = "Retriever: loaded"
     except Exception as e:
         ret_status = f"Retriever ERROR: {e}"
-        print(ret_status, file=sys.stderr)
+        _log.error("Retriever failed to load", exc_info=True)
 
     try:
         from app.llm import load_llm
@@ -58,10 +91,10 @@ def _load_components(
         llm_status = "LLM: loaded"
     except FileNotFoundError as e:
         llm_status = f"LLM: model not found — {e}"
-        print(llm_status, file=sys.stderr)
+        _log.warning("LLM model file not found: %s", e)
     except Exception as e:
         llm_status = f"LLM ERROR: {e}"
-        print(llm_status, file=sys.stderr)
+        _log.error("LLM failed to load", exc_info=True)
 
     return ret_status, llm_status
 
@@ -219,11 +252,73 @@ def open_file(result_num: int, chunks_state: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Log folder handler
+# ---------------------------------------------------------------------------
+
+def open_log_folder() -> str:
+    """Open the logs/ directory in the system file explorer."""
+    logs = log_dir()
+    logs.mkdir(parents=True, exist_ok=True)
+    try:
+        if sys.platform == 'win32':
+            os.startfile(str(logs))
+        elif sys.platform == 'darwin':
+            subprocess.run(['open', str(logs)], check=True)
+        else:
+            subprocess.run(['xdg-open', str(logs)], check=True)
+        return f"Opened: {logs}"
+    except Exception as e:
+        return f"Could not open log folder: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Friendly error parsing
+# ---------------------------------------------------------------------------
+
+# (pattern, user-facing message)
+_ERROR_PATTERNS = [
+    (
+        ['Word blocked', 'trust', '-2146821993', 'detected a problem'],
+        "Word security blocked some files.\n"
+        "Fix: add your sermon folder to Word Trusted Locations, or use the "
+        "'Unblock Sermon Library' button (Tier 2), then click Process New Files again.",
+    ),
+    (
+        ['Permission denied', 'PermissionError'],
+        "Could not access some files — they may be open in another program. "
+        "Close any open Word or PowerPoint windows and try again.",
+    ),
+    (
+        ['ModuleNotFoundError', 'ImportError', 'No module named'],
+        "A required package is missing. Re-run setup.bat to repair the installation.",
+    ),
+    (
+        ['antiword: not found', "'antiword'"],
+        "antiword is not installed. On Linux/WSL run: sudo apt-get install antiword",
+    ),
+]
+
+
+def _friendly_summary(raw_log: str) -> str:
+    """Return a plain-English summary line if a known error pattern is found."""
+    for patterns, message in _ERROR_PATTERNS:
+        if any(p in raw_log for p in patterns):
+            return f"⚠️  {message}"
+    if '[exit code:' in raw_log:
+        return (
+            "⚠️  Something went wrong during processing. "
+            "See the technical log below or check logs/app.log for details."
+        )
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Manage Archive handlers
 # ---------------------------------------------------------------------------
 
 def _run_subprocess(cmd: list[str]) -> str:
     """Run a subprocess, capture stdout+stderr, return combined output."""
+    _log = get_logger(__name__)
     try:
         result = subprocess.run(
             cmd,
@@ -236,66 +331,91 @@ def _run_subprocess(cmd: list[str]) -> str:
             out += "\n[stderr]\n" + result.stderr
         if result.returncode != 0:
             out += f"\n[exit code: {result.returncode}]"
+            _log.error("Subprocess exited %d: %s\n%s", result.returncode, cmd, out)
         return out
     except Exception as e:
+        _log.error("Subprocess launch failed: %s", cmd, exc_info=True)
         return f"Subprocess error: {e}"
 
 
-def process_new_files(folder: str) -> str:
-    """Ingest + incremental embed for a new folder of sermon files."""
+def _validate_and_persist_folder(folder: str) -> tuple[str, str] | None:
+    """Validate folder path and persist it. Returns (None, None) on success,
+    or (summary, raw_log) error tuple on failure."""
     if not folder or not folder.strip():
-        return "Please enter a folder path."
+        msg = "Please enter your sermon library folder path."
+        return msg, ""
+    folder = folder.strip()
+    if not Path(folder).is_dir():
+        msg = (
+            f"Folder not found: {folder}\n\n"
+            "Check that the path is correct and the drive is connected, then try again."
+        )
+        return msg, ""
+    settings = load_settings()
+    settings['sermon_library_folder'] = folder
+    save_settings(settings)
+    return None, None
 
-    log = f"=== Processing new files from: {folder} ===\n\n"
 
-    log += "--- Step 1: Ingest files ---\n"
-    log += _run_subprocess([sys.executable, "build/01_ingest_files.py", "--source", folder, "--verbose"])
-    log += "\n\n--- Step 2: Incremental embed ---\n"
-    log += _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--incremental"])
+def process_new_files(folder: str) -> tuple[str, str]:
+    """Ingest + incremental embed. Returns (summary, raw_log)."""
+    err_summary, err_log = _validate_and_persist_folder(folder)
+    if err_summary is not None:
+        return err_summary, err_log
 
-    # Reload retriever in-place
-    log += "\n\n--- Reloading retriever ---\n"
+    folder = folder.strip()
+    raw = f"=== Processing new files from: {folder} ===\n\n"
+    raw += "--- Step 1: Ingest files ---\n"
+    raw += _run_subprocess([sys.executable, "build/01_ingest_files.py", "--source", folder, "--verbose"])
+    raw += "\n\n--- Step 2: Incremental embed ---\n"
+    raw += _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--incremental"])
+
+    raw += "\n\n--- Reloading retriever ---\n"
     try:
         from app.retriever import load_retriever
         global _retriever
         _retriever = load_retriever(
             db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH
         )
-        log += "Retriever reloaded successfully.\n"
+        raw += "Retriever reloaded successfully.\n"
     except Exception as e:
-        log += f"Retriever reload failed: {e}\n"
+        raw += f"Retriever reload failed: {e}\n"
+        get_logger(__name__).error("Retriever reload failed", exc_info=True)
 
-    return log
+    summary = _friendly_summary(raw) or "✅  Processing complete."
+    return summary, raw
 
 
-def full_rebuild(folder: str) -> str:
-    """Full ingest (force) + full embed rebuild."""
-    if not folder or not folder.strip():
-        return "Please enter a folder path."
+def full_rebuild(folder: str) -> tuple[str, str]:
+    """Full ingest (force) + full embed rebuild. Returns (summary, raw_log)."""
+    err_summary, err_log = _validate_and_persist_folder(folder)
+    if err_summary is not None:
+        return err_summary, err_log
 
-    log = f"=== Full rebuild from: {folder} ===\n\n"
-
-    log += "--- Step 1: Ingest files (force) ---\n"
-    log += _run_subprocess([
+    folder = folder.strip()
+    raw = f"=== Full rebuild from: {folder} ===\n\n"
+    raw += "--- Step 1: Ingest files (force) ---\n"
+    raw += _run_subprocess([
         sys.executable, "build/01_ingest_files.py",
         "--source", folder, "--force", "--verbose",
     ])
-    log += "\n\n--- Step 2: Full embed rebuild ---\n"
-    log += _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--force"])
+    raw += "\n\n--- Step 2: Full embed rebuild ---\n"
+    raw += _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--force"])
 
-    # Reload retriever in-place
-    log += "\n\n--- Reloading retriever ---\n"
+    raw += "\n\n--- Reloading retriever ---\n"
     try:
         from app.retriever import load_retriever
         global _retriever
         _retriever = load_retriever(
             db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH
         )
-        log += "Retriever reloaded successfully.\n"
+        raw += "Retriever reloaded successfully.\n"
     except Exception as e:
-        log += f"Retriever reload failed: {e}\n"
+        raw += f"Retriever reload failed: {e}\n"
+        get_logger(__name__).error("Retriever reload failed", exc_info=True)
 
-    return log
+    summary = _friendly_summary(raw) or "✅  Rebuild complete."
+    return summary, raw
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +432,10 @@ footer { display: none !important; }
 
 def build_ui():
     import gradio as gr
+
+    # Load persisted settings for default values
+    _settings = load_settings()
+    _saved_folder = _settings.get('sermon_library_folder', '')
 
     with gr.Blocks(title="Sermon Note Search", theme=gr.themes.Soft(), css=CSS) as demo:
         gr.Markdown("# Sermon Note Search")
@@ -390,14 +514,17 @@ def build_ui():
             # ----------------------------------------------------------------
             with gr.Tab("Manage Archive"):
                 gr.Markdown(
-                    "### Add or rebuild the sermon archive\n"
-                    "Enter the path to a folder containing new sermon files, "
-                    "then choose an action."
+                    "### Sermon library folder\n"
+                    "Set this to your **main sermon library folder** — the single folder "
+                    "(or folder tree) where all your sermon files live. "
+                    "Add new sermon files into that folder first, then click "
+                    "**Process New Files** to index them."
                 )
 
                 folder_box = gr.Textbox(
-                    label="New sermon files folder",
-                    placeholder=r"e.g. C:\Sermons\2025  or  ./new_sermons",
+                    label="Sermon library folder",
+                    placeholder=r"e.g. C:\Sermons  or  E:\Ministry\Sermons",
+                    value=_saved_folder,
                     lines=1,
                 )
 
@@ -405,15 +532,29 @@ def build_ui():
                     process_btn = gr.Button("➕ Process New Files", variant="primary")
                     rebuild_btn = gr.Button("🔄 Full Rebuild", variant="secondary")
 
-                archive_log = gr.Textbox(
-                    label="Output log",
-                    interactive=False,
-                    lines=12,
-                    max_lines=20,
-                )
+                archive_summary = gr.Markdown(value="")
 
-                process_btn.click(fn=process_new_files, inputs=[folder_box], outputs=[archive_log])
-                rebuild_btn.click(fn=full_rebuild, inputs=[folder_box], outputs=[archive_log])
+                with gr.Accordion("Technical log", open=False):
+                    archive_log = gr.Textbox(
+                        label="",
+                        show_label=False,
+                        interactive=False,
+                        lines=12,
+                        max_lines=20,
+                    )
+
+                with gr.Row():
+                    log_btn = gr.Button("📂 Open Log Folder", variant="secondary")
+                    log_status = gr.Textbox(
+                        label="", interactive=False, show_label=False,
+                        placeholder="Log files are saved to logs/app.log",
+                        scale=4,
+                    )
+
+                archive_outputs = [archive_summary, archive_log]
+                process_btn.click(fn=process_new_files, inputs=[folder_box], outputs=archive_outputs)
+                rebuild_btn.click(fn=full_rebuild, inputs=[folder_box], outputs=archive_outputs)
+                log_btn.click(fn=open_log_folder, inputs=[], outputs=[log_status])
 
     return demo
 
@@ -424,9 +565,9 @@ def build_ui():
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description='Gradio UI for AI-Powered Sermon Note Search.')
-    p.add_argument('--host',  metavar='STR', default='127.0.0.1')
+    p.add_argument('--host',  metavar='STR', default='127.0.0.1',
+                   help='Bind address (default: 127.0.0.1 — local only)')
     p.add_argument('--port',  metavar='INT', type=int, default=7860)
-    p.add_argument('--share', action='store_true', help='Create a public Gradio share link')
     p.add_argument('--db',    metavar='PATH', default=DB_PATH)
     p.add_argument('--faiss', metavar='PATH', default=FAISS_PATH)
     p.add_argument('--idmap', metavar='PATH', default=ID_MAP_PATH)
@@ -435,6 +576,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    setup_logging()
     parser = build_parser()
     args = parser.parse_args()
 
@@ -449,10 +591,14 @@ def main() -> None:
     print(llm_status)
 
     demo = build_ui()
+    # inbrowser=True opens the browser only after Gradio's server is ready,
+    # avoiding the "Site Not Found" error on slow machines.
+    # share=False (default) keeps the app strictly local — no public Gradio tunnel.
     demo.launch(
         server_name=args.host,
         server_port=args.port,
-        share=args.share,
+        share=False,
+        inbrowser=True,
     )
 
 
