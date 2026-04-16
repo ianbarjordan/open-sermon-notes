@@ -829,7 +829,7 @@ def build_ui():
     _settings = load_settings()
     _saved_folder = _settings.get('sermon_library_folder', '')
 
-    with gr.Blocks(title="Sermon Note Search") as demo:
+    with gr.Blocks(title="Sermon Note Search", theme=gr.themes.Soft()) as demo:
 
         # ── App header ────────────────────────────────────────────────────
         gr.HTML("""
@@ -1148,7 +1148,6 @@ def main() -> None:
         server_port=args.port,
         share=False,
         inbrowser=True,
-        theme=gr.themes.Soft(),
         css=CSS,
     )
 
