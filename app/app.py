@@ -272,16 +272,16 @@ def open_log_folder() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Friendly error parsing
+# Run summary: parse ingest output + friendly errors
 # ---------------------------------------------------------------------------
 
-# (pattern, user-facing message)
+# (trigger strings, user-facing message)
 _ERROR_PATTERNS = [
     (
         ['Word blocked', 'trust', '-2146821993', 'detected a problem'],
-        "Word security blocked some files.\n"
-        "Fix: add your sermon folder to Word Trusted Locations, or use the "
-        "'Unblock Sermon Library' button (Tier 2), then click Process New Files again.",
+        "Word security blocked some files. "
+        "Use the **Unblock Sermon Library** button below, then click "
+        "**Process New Files** again.",
     ),
     (
         ['Permission denied', 'PermissionError'],
@@ -294,22 +294,180 @@ _ERROR_PATTERNS = [
     ),
     (
         ['antiword: not found', "'antiword'"],
-        "antiword is not installed. On Linux/WSL run: sudo apt-get install antiword",
+        "antiword is not installed. On Linux/WSL run: `sudo apt-get install antiword`",
     ),
 ]
 
+# Quarantine reasons that count as "skipped" (not errors, not accepted)
+_SKIP_OUTCOMES = {
+    'too_short', 'non_faith', 'filename_flagged', 'format_pub',
+    'worship_slides', 'sparse_pptx', 'duplicates', 'skipped', 'skipped_exists',
+}
 
-def _friendly_summary(raw_log: str) -> str:
-    """Return a plain-English summary line if a known error pattern is found."""
+
+def _parse_ingest_counts(raw_log: str) -> dict[str, int]:
+    """Extract outcome counts from the '--- Ingest Summary ---' block in raw log."""
+    import re
+    counts: dict[str, int] = {}
+    in_summary = False
+    for line in raw_log.splitlines():
+        if '--- Ingest Summary ---' in line:
+            in_summary = True
+            continue
+        if in_summary:
+            m = re.match(r'\s+(\w+)\s+(\d+)', line)
+            if m:
+                counts[m.group(1)] = int(m.group(2))
+    return counts
+
+
+def _quarantine_filenames(quarantine_root: str, reason: str, limit: int = 10) -> list[str]:
+    """Return up to `limit` filenames from a quarantine sub-folder."""
+    qdir = Path(_PROJECT_ROOT) / quarantine_root / reason
+    if not qdir.exists():
+        return []
+    names = sorted(p.name for p in qdir.iterdir() if p.is_file())
+    return names[:limit]
+
+
+def _build_run_summary(
+    raw_log: str,
+    quarantine_root: str = 'raw/quarantine',
+    operation: str = 'Processing',
+) -> str:
+    """Build a human-readable Markdown summary from an ingest+embed run."""
+    lines: list[str] = []
+
+    # --- Error patterns take priority ---
+    _error_matched = False
     for patterns, message in _ERROR_PATTERNS:
         if any(p in raw_log for p in patterns):
-            return f"⚠️  {message}"
-    if '[exit code:' in raw_log:
-        return (
-            "⚠️  Something went wrong during processing. "
-            "See the technical log below or check logs/app.log for details."
+            lines.append(f"⚠️  {message}")
+            _error_matched = True
+            break
+    if not _error_matched and '[exit code:' in raw_log:
+        lines.append(
+            "⚠️  Something went wrong. "
+            "See the technical log below or check **logs/app.log** for details."
         )
-    return ""
+
+    # --- Ingest counts ---
+    counts = _parse_ingest_counts(raw_log)
+    if counts:
+        accepted = counts.get('accepted', 0)
+        manual_review = counts.get('manual_review', 0)
+        skipped = sum(counts.get(r, 0) for r in _SKIP_OUTCOMES)
+
+        parts: list[str] = []
+        if accepted > 0:
+            noun = 'sermon' if accepted == 1 else 'sermons'
+            parts.append(f"✅  **{accepted}** {noun} added to the archive")
+        elif not lines:
+            parts.append("ℹ️  No new sermons found.")
+
+        if manual_review > 0:
+            noun = 'file' if manual_review == 1 else 'files'
+            blocked = _quarantine_filenames(quarantine_root, 'manual_review')
+            block_list = '\n'.join(f"  • {f}" for f in blocked)
+            total_blocked = counts.get('manual_review', 0)
+            overflow = f"\n  *(…and {total_blocked - len(blocked)} more)*" if total_blocked > len(blocked) else ''
+            parts.append(
+                f"⚠️  **{manual_review}** {noun} need attention "
+                f"(Word security blocked):\n{block_list}{overflow}\n\n"
+                "Use **Unblock Sermon Library** below, then click **Process New Files** again."
+            )
+
+        if skipped > 0:
+            noun = 'file' if skipped == 1 else 'files'
+            parts.append(
+                f"ℹ️  **{skipped}** {noun} skipped "
+                "(too short, non-faith content, duplicates, etc.)"
+            )
+
+        lines.extend(parts)
+
+    if not lines:
+        lines.append(f"✅  {operation} complete.")
+
+    return '\n\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Unblock handler (Windows only)
+# ---------------------------------------------------------------------------
+
+def unblock_library(folder: str) -> tuple[str, str]:
+    """Run PowerShell Unblock-File on all files in the sermon library folder.
+
+    Returns (summary, raw_log). Only meaningful on Windows; shows a clear
+    message on other platforms.
+    """
+    if not folder or not folder.strip():
+        return "Please enter your sermon library folder path first.", ""
+    folder = folder.strip()
+    if not Path(folder).is_dir():
+        return f"Folder not found: {folder}", ""
+
+    if sys.platform != 'win32':
+        return "ℹ️  Unblock-File is a Windows-only operation.", ""
+
+    raw = f"=== Unblocking files in: {folder} ===\n\n"
+    cmd = [
+        'powershell', '-NoProfile', '-NonInteractive', '-Command',
+        f'Get-ChildItem -Path "{folder}" -Recurse -File | Unblock-File -Confirm:$false; '
+        f'Write-Output "Done."',
+    ]
+    _log = get_logger(__name__)
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=_PROJECT_ROOT
+        )
+        raw += result.stdout
+        if result.stderr:
+            raw += '\n[stderr]\n' + result.stderr
+        if result.returncode != 0:
+            raw += f'\n[exit code: {result.returncode}]'
+            _log.error('Unblock-File exited %d\n%s', result.returncode, raw)
+            summary = '⚠️  Unblock command finished with errors. See the technical log.'
+        else:
+            summary = (
+                '✅  Files unblocked successfully.\n\n'
+                'Click **Process New Files** to retry ingesting the blocked sermons.'
+            )
+    except Exception as e:
+        _log.error('Unblock-File failed', exc_info=True)
+        raw += f'Error: {e}'
+        summary = f'⚠️  Could not run PowerShell: {e}'
+
+    return summary, raw
+
+
+# ---------------------------------------------------------------------------
+# Folder picker (Windows: tkinter subprocess; other: no-op)
+# ---------------------------------------------------------------------------
+
+def browse_folder() -> str:
+    """Open a native folder picker dialog and return the selected path.
+
+    Runs tkinter in a subprocess to avoid GUI/thread conflicts with Gradio.
+    Returns '' on cancel or if tkinter is unavailable.
+    """
+    if sys.platform != 'win32':
+        return ''
+    try:
+        result = subprocess.run(
+            [
+                sys.executable, '-c',
+                'import tkinter as tk; from tkinter import filedialog; '
+                'root = tk.Tk(); root.withdraw(); root.wm_attributes("-topmost", 1); '
+                'path = filedialog.askdirectory(title="Select your sermon library folder"); '
+                'print(path, end="")',
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ''
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +540,7 @@ def process_new_files(folder: str) -> tuple[str, str]:
         raw += f"Retriever reload failed: {e}\n"
         get_logger(__name__).error("Retriever reload failed", exc_info=True)
 
-    summary = _friendly_summary(raw) or "✅  Processing complete."
+    summary = _build_run_summary(raw, operation='Processing')
     return summary, raw
 
 
@@ -414,7 +572,7 @@ def full_rebuild(folder: str) -> tuple[str, str]:
         raw += f"Retriever reload failed: {e}\n"
         get_logger(__name__).error("Retriever reload failed", exc_info=True)
 
-    summary = _friendly_summary(raw) or "✅  Rebuild complete."
+    summary = _build_run_summary(raw, operation='Rebuild')
     return summary, raw
 
 
@@ -521,12 +679,16 @@ def build_ui():
                     "**Process New Files** to index them."
                 )
 
-                folder_box = gr.Textbox(
-                    label="Sermon library folder",
-                    placeholder=r"e.g. C:\Sermons  or  E:\Ministry\Sermons",
-                    value=_saved_folder,
-                    lines=1,
-                )
+                with gr.Row():
+                    folder_box = gr.Textbox(
+                        label="Sermon library folder",
+                        placeholder=r"e.g. C:\Sermons  or  E:\Ministry\Sermons",
+                        value=_saved_folder,
+                        lines=1,
+                        scale=5,
+                    )
+                    if sys.platform == 'win32':
+                        browse_btn = gr.Button("📁 Browse…", scale=1)
 
                 with gr.Row():
                     process_btn = gr.Button("➕ Process New Files", variant="primary")
@@ -543,6 +705,14 @@ def build_ui():
                         max_lines=20,
                     )
 
+                gr.Markdown("---")
+                gr.Markdown(
+                    "**Unblock Sermon Library** — if Word security is blocking `.doc` files, "
+                    "run this to remove the Windows security flag from all files in your library. "
+                    "*Only use this on folders you fully trust.*"
+                )
+                unblock_btn = gr.Button("🔓 Unblock Sermon Library", variant="secondary")
+
                 with gr.Row():
                     log_btn = gr.Button("📂 Open Log Folder", variant="secondary")
                     log_status = gr.Textbox(
@@ -554,7 +724,10 @@ def build_ui():
                 archive_outputs = [archive_summary, archive_log]
                 process_btn.click(fn=process_new_files, inputs=[folder_box], outputs=archive_outputs)
                 rebuild_btn.click(fn=full_rebuild, inputs=[folder_box], outputs=archive_outputs)
+                unblock_btn.click(fn=unblock_library, inputs=[folder_box], outputs=archive_outputs)
                 log_btn.click(fn=open_log_folder, inputs=[], outputs=[log_status])
+                if sys.platform == 'win32':
+                    browse_btn.click(fn=browse_folder, inputs=[], outputs=[folder_box])
 
     return demo
 
