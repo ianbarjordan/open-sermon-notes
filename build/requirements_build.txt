@@ -1,12 +1,15 @@
 # Install torch FIRST before this file:
-#   Windows (CPU):  pip install torch
+#   Windows (CPU):  pip install torch --index-url https://download.pytorch.org/whl/cpu
 #   Linux/CUDA:     uv pip install torch
+#
+# All versions pinned exactly — required for reproducible PyInstaller builds.
+# Bumping a version is a deliberate action: re-test the full suite, then update.
 
-sentence-transformers>=3.0,<4   # BAAI/bge-small-en-v1.5
-faiss-cpu>=1.8
-numpy>=1.26
-python-docx>=1.1,<2             # .docx parsing
-python-pptx>=0.6,<1             # .pptx parsing
-tqdm>=4.66,<5
-huggingface_hub>=0.20                   # model download in setup.bat
-pywin32>=306; sys_platform == "win32"   # .doc parsing via Word COM (Windows only)
+sentence-transformers==3.4.1     # BAAI/bge-small-en-v1.5
+faiss-cpu==1.13.2
+numpy==2.4.4
+python-docx==1.2.0               # .docx parsing
+python-pptx==0.6.23              # .pptx parsing
+tqdm==4.67.3
+huggingface_hub==0.36.2          # model download in setup.bat
+pywin32==311; sys_platform == "win32"   # .doc parsing via Word COM (Windows only)
