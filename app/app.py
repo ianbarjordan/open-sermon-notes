@@ -595,6 +595,16 @@ def _validate_and_persist_folder(folder: str) -> tuple[str, str] | None:
         msg = "Please enter your sermon library folder path."
         return msg, ""
     folder = folder.strip()
+    # Reject quote characters: the path flows into PowerShell command strings
+    # (Unblock-File) which would mis-parse on a stray " or '. Rejecting at
+    # validation time is the simplest belt-and-braces fix.
+    if '"' in folder or "'" in folder:
+        msg = (
+            "Folder path contains a quote character (\" or '), which is not "
+            "supported. Rename the folder or move the library to a path without "
+            "quotes and try again."
+        )
+        return msg, ""
     if not Path(folder).is_dir():
         msg = (
             f"Folder not found: {folder}\n\n"

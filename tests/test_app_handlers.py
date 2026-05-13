@@ -918,3 +918,37 @@ def test_execute_batch_action_ignore_one_missing_filename_noops():
     assert cleared == _CLEARED
     assert col_update.get('visible') is False
     assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# B-7: reject quote characters in folder paths
+# ---------------------------------------------------------------------------
+
+def test_validate_folder_rejects_double_quote(tmp_path):
+    """Folder paths containing " break PowerShell command strings — reject them."""
+    bad_path = str(tmp_path) + '/some"weird/folder'
+    result = app_module._validate_and_persist_folder(bad_path)
+    assert result is not None
+    summary, _log = result
+    assert 'quote' in summary.lower()
+
+
+def test_validate_folder_rejects_single_quote(tmp_path):
+    bad_path = str(tmp_path) + "/some'weird/folder"
+    result = app_module._validate_and_persist_folder(bad_path)
+    assert result is not None
+    summary, _log = result
+    assert 'quote' in summary.lower()
+
+
+def test_validate_folder_accepts_normal_path(tmp_path, monkeypatch):
+    """Normal paths still pass validation and persist to settings."""
+    saved = {}
+    monkeypatch.setattr(app_module, 'load_settings', lambda: {})
+    monkeypatch.setattr(
+        app_module, 'save_settings',
+        lambda s: saved.update(s),
+    )
+    result = app_module._validate_and_persist_folder(str(tmp_path))
+    assert result == (None, None)
+    assert saved.get('sermon_library_folder') == str(tmp_path)
