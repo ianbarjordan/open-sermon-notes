@@ -175,6 +175,25 @@ def _slice_chunks(all_chunks: list, top_k: int) -> tuple[list, str]:
     return visible, status
 
 
+_NO_LIBRARY_MSG = (
+    "**No sermon library set yet.** "
+    "Open the **📁 Manage Archive** tab, point to your sermon folder, "
+    "then click **Process New Files** to build the index. "
+    "Search will work once that's done."
+)
+
+
+def _library_is_configured() -> bool:
+    """True iff a sermon library folder is set in settings AND exists on disk."""
+    folder = load_settings().get('sermon_library_folder', '').strip()
+    if not folder:
+        return False
+    try:
+        return Path(folder).is_dir()
+    except Exception:
+        return False
+
+
 def handle_query(query: str, top_k: int = TOP_K):
     """Search handler — returns (answer, dataframe_rows, status, chunks_state).
 
@@ -185,6 +204,12 @@ def handle_query(query: str, top_k: int = TOP_K):
 
     if not query or not query.strip():
         return empty
+
+    # Library-not-configured guard: without a valid sermon root, any results
+    # we return will have unresolvable file paths — the pastor would see rows
+    # they cannot open. Guide them to the setup step instead.
+    if not _library_is_configured():
+        return (_NO_LIBRARY_MSG, [], "Set your sermon library folder first.", [])
 
     if _retriever is None:
         return ("Retriever is not available. Check startup logs.", [], "Error: retriever not loaded", [])

@@ -7,9 +7,27 @@ import unittest.mock as mock
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import app.app as app_module
+
+# Capture the real _library_is_configured BEFORE the autouse fixture
+# replaces it, so tests that exercise the guard can restore it.
+_REAL_LIBRARY_IS_CONFIGURED = app_module._library_is_configured
+
+
+# ---------------------------------------------------------------------------
+# Library-configured fixture: most tests assume the sermon folder is set up;
+# the B-4 guard would otherwise short-circuit handle_query before reaching
+# the retriever mock. Tests that exercise the guard itself restore the real
+# implementation via _REAL_LIBRARY_IS_CONFIGURED.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _library_configured(monkeypatch):
+    monkeypatch.setattr(app_module, '_library_is_configured', lambda: True)
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +70,52 @@ def test_handle_query_no_retriever():
     app_module._retriever = None
     answer, rows, status, state = app_module.handle_query("grace", 5)
     assert "not available" in answer.lower() or "retriever" in answer.lower()
+
+
+# ---------------------------------------------------------------------------
+# B-4: library-not-configured guard
+# ---------------------------------------------------------------------------
+
+def test_handle_query_no_library_configured(monkeypatch):
+    """If no sermon folder is set, return a friendly setup-guidance message
+    instead of running a search that would yield unopenable file rows."""
+    monkeypatch.setattr(app_module, '_library_is_configured', lambda: False)
+    mock_retriever = mock.MagicMock()
+    app_module._retriever = mock_retriever
+    answer, rows, status, state = app_module.handle_query("grace", 5)
+    assert "manage archive" in answer.lower()
+    assert "sermon" in answer.lower()
+    assert rows == []
+    assert state == []
+    # The retriever must NOT be called when no library is configured
+    mock_retriever.search.assert_not_called()
+
+
+def test_library_is_configured_empty_settings(tmp_path, monkeypatch):
+    """No folder in settings → False."""
+    monkeypatch.setattr(app_module, '_library_is_configured', _REAL_LIBRARY_IS_CONFIGURED)
+    monkeypatch.setattr(app_module, 'load_settings', lambda: {})
+    assert app_module._library_is_configured() is False
+
+
+def test_library_is_configured_folder_missing(tmp_path, monkeypatch):
+    """Folder set in settings but does not exist on disk → False."""
+    monkeypatch.setattr(app_module, '_library_is_configured', _REAL_LIBRARY_IS_CONFIGURED)
+    monkeypatch.setattr(
+        app_module, 'load_settings',
+        lambda: {'sermon_library_folder': str(tmp_path / 'nonexistent')},
+    )
+    assert app_module._library_is_configured() is False
+
+
+def test_library_is_configured_valid_folder(tmp_path, monkeypatch):
+    """Folder set + exists on disk → True."""
+    monkeypatch.setattr(app_module, '_library_is_configured', _REAL_LIBRARY_IS_CONFIGURED)
+    monkeypatch.setattr(
+        app_module, 'load_settings',
+        lambda: {'sermon_library_folder': str(tmp_path)},
+    )
+    assert app_module._library_is_configured() is True
 
 
 def test_handle_query_returns_rows():
