@@ -50,6 +50,7 @@ app/app.py   ← Gradio UI: query → hybrid retrieval (FAISS+FTS5+RRF) → Phi-
 | `logging_config.py` | Rotating file logger (5 MB × 3); `logs/app.log` |
 | `retriever.py` | `load_retriever(sermon_root=)` factory; hybrid dense+sparse+RRF search |
 | `llm.py` | `load_llm()` factory; `detect_n_gpu_layers()` auto-GPU; `LLM.generate()` |
+| `handlers.py` | Minimal shared helpers — currently just `reload_retriever()`; absorbs more during Item 18 split |
 | `app.py` | Gradio Blocks UI; 3 tabs: Search, Quarantine, Manage Archive |
 
 ---
@@ -110,7 +111,8 @@ app/app.py   ← Gradio UI: query → hybrid retrieval (FAISS+FTS5+RRF) → Phi-
 | `CTX_WINDOW` | `4096` | Phi-3.5-mini context |
 | `N_GPU_LAYERS` | `0` | Override; auto-detection via `detect_n_gpu_layers()` |
 | `TOP_K` | `5` | Default slider value (minimum shown) |
-| `MAX_TOP_K` | `50` | Slider ceiling |
+| `MAX_TOP_K` | `50` | Internal retrieval pool (auto-expansion ranks across this many) |
+| `MAX_VISIBLE_ROWS` | `20` | Hard cap on rows shown in the results table |
 | `AUTO_EXPAND_THRESHOLD` | `0.023` | ≈70% of RRF max — auto-expands results beyond slider |
 | `LOW_CONFIDENCE_THRESHOLD` | `0.018` | Below this, warn user |
 | `RRF_K` | `60` | Reciprocal Rank Fusion constant |
@@ -125,27 +127,38 @@ app/app.py   ← Gradio UI: query → hybrid retrieval (FAISS+FTS5+RRF) → Phi-
 ## UI — Three Tabs
 
 ### 🔍 Search
-- Full-width query box; Enter or Search button submits
+- Full-width single-line query box; Enter or Search button submits
 - Answer box with pastoral styling (warm left border accent)
-- Matching Passages dataframe (up to MAX_TOP_K rows)
+- Matching Passages dataframe (capped at `MAX_VISIBLE_ROWS`=20 so it stays scannable)
 - Min. results slider: sets floor; auto-expansion adds high-confidence results beyond it
   without re-searching (slider change re-slices cached pool via `expand_results()`)
 - Row click or Row # + Open File button opens source file in native app
 - `chunks_state` gr.State stores the full MAX_TOP_K pool fetched per query
+- B-4 guard: if no sermon folder is configured, a setup-guidance message
+  replaces results — the retriever is never invoked on an unconfigured library
 
 ### ⚠️ Quarantine
 - Summary line with Refresh button
 - One accordion per non-empty bucket, ordered by descending file count
 - `manual_review` (Word-blocked .doc) opens by default; hint links to Unblock button
 - Buckets >200 files capped at 200 with batch-unblock guidance
+- Per-bucket batch buttons: **Delete All (N)** and **Force Ingest All (N)** route
+  through a shared confirmation panel before any destructive action runs
 - Per-file: Force Ingest (unblock + copy to library + re-ingest + reload retriever)
-  or Ignore (permanent delete from quarantine)
+  or Ignore — **Ignore also routes through the confirmation panel** (B-6)
 
 ### 📁 Manage Archive
 - Sermon library folder path + Browse button (Windows native tkinter picker)
+- Folder path validation rejects quote characters `"` / `'` (B-7); changing
+  the path shows a restart-required notice
 - Process New Files (incremental) / Full Rebuild buttons
+- **Full Rebuild routes through a confirmation panel** before running (S-8)
+- All long-running buttons use generator wrappers that yield an immediate
+  "Working..." state, then the final result — pastor sees the click register (S-1)
 - Summary markdown + collapsed Technical log accordion
-- Unblock Sermon Library (PowerShell Unblock-File, Windows only)
+- Unblock Sermon Library (PowerShell Unblock-File, Windows only); failure
+  messages are classified (Administrator-permission / folder-missing / generic)
+  and give a concrete next step (S-9)
 - Open Log Folder button
 
 ---
@@ -216,16 +229,18 @@ Target deployment machine is CPU-only; ship standard CPU wheel.
 ## Dependencies
 
 ### Build (`build/requirements_build.txt`)
-- `sentence-transformers>=3.0` — BGE-small embedding
-- `faiss-cpu>=1.8` — vector index
-- `python-docx>=1.1`, `python-pptx>=0.6` — OOXML parsing
-- `numpy>=1.26`, `tqdm>=4.66`
-- `pywin32>=306` *(Windows only)*
+All versions pinned exactly (S-11).
+- `sentence-transformers==3.4.1` — BGE-small embedding
+- `faiss-cpu==1.13.2` — vector index
+- `python-docx==1.2.0`, `python-pptx==0.6.23` — OOXML parsing
+- `numpy==2.4.4`, `tqdm==4.67.3`, `huggingface_hub==0.36.2`
+- `pywin32==311` *(Windows only)*
 
 ### App (`app/requirements_app.txt`)
-- `gradio>=6.0` — Blocks web UI (tested with 6.12)
+All versions pinned exactly (S-11) — required for reproducible PyInstaller builds.
+- `gradio==6.12.0` — Blocks web UI
 - `llama-cpp-python==0.3.16` — CPU build for target machine
-- `faiss-cpu>=1.8`, `sentence-transformers>=3.0`, `numpy>=1.26`
+- `faiss-cpu==1.13.2`, `sentence-transformers==3.4.1`, `numpy==2.4.4`
 
 ### System
 - Python 3.11
@@ -285,17 +300,18 @@ launch.bat
 
 ## Test Suite
 
-178 tests across 6 test files. Run with:
+213 tests across 7 test files. Run with:
 ```bat
 .venv\Scripts\python.exe -m pytest tests\ -v
 ```
 
 | File | Coverage |
 |------|---------|
-| `test_app_handlers.py` | handle_query, expand_results, open_file, on_row_select, quarantine handlers, settings, archive handlers |
+| `test_app_handlers.py` | handle_query, expand_results, open_file, on_row_select, library-configured guard, quarantine handlers (incl. per-file ignore confirm), settings, archive handlers, generator progress wrappers, Full Rebuild confirm flow, quote-path validation, unblock failure classifier |
+| `test_handlers.py` | reload_retriever success/failure paths |
 | `test_config.py` | config constants, thresholds |
 | `test_incremental_embed.py` | init_db, build_index_incremental, load_documents_from_db, sha256 stale detection |
 | `test_ingest_registry.py` | hash registry load/save |
 | `test_parse_filename.py` | filename parser |
 | `test_retriever_utils.py` | FTS5 sanitize, RRF fusion |
-| `test_llm.py` | detect_n_gpu_layers, _format_chunk, _build_user_message |
+| `test_llm.py` | detect_n_gpu_layers, _format_chunk, _build_user_message, stop-tokens regression (B-3) |

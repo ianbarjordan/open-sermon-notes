@@ -106,42 +106,115 @@ Next session: start with item 17 (PyInstaller packaging)
 
 ---
 
+## Pre-delivery Code Review  ✅ COMPLETE (2026-05-13)
+
+16-commit pass landed before Item 17. Findings + plan archived at
+`C:\Users\Ian\.claude\plans\graceful-tickling-gray*.md`.
+
+Commits in order:
+- S-4 silent-except logging · S-3 print→logging · B-3 LLM stop tokens
+- B-4 library-configured guard · B-6 per-file Ignore confirm · B-7 quote-path reject
+- S-1 working-state generators · S-2 sanitized errors · S-5 missing-model copy
+- S-6/S-7 launch.bat hardening · S-8 Full Rebuild confirm · S-9 unblock classifier
+- S-10 MAX_VISIBLE_ROWS=20 cap · S-11 pinned requirements
+- D-1 (minimal) `app/handlers.py` w/ `reload_retriever()`
+- Docs sweep (this commit)
+
+213 tests passing at the end of the review.
+
+---
+
 ## Tier 6 — Packaging & distribution
 
 ### 17. PyInstaller / portable launcher
-- Use `--onedir` mode (not `--onefile` — llama-cpp native libs won't bundle cleanly)
-- Update `_PROJECT_ROOT` detection to handle `sys.frozen` (PyInstaller) vs source mode:
-  ```python
-  if getattr(sys, 'frozen', False):
-      _PROJECT_ROOT = Path(sys.executable).parent
-  else:
-      _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-  ```
+
+**Three architectural changes absorbed from the pre-delivery review (B-1, B-2)
+that are scope-of-Item-17 — they cannot be patched, they are the packaging work.**
+
+#### B-1 · In-process build pipeline (single largest piece of Item 17)
+The four archive/quarantine handlers currently spawn `sys.executable
+build/NN_script.py` to run the build scripts. Under a frozen PyInstaller
+bundle `sys.executable` is the launcher `.exe` — there is no python
+interpreter to hand a script to. Every Process New Files / Full Rebuild /
+Force Ingest call will fail at runtime once packaged.
+
+Refactor `build/01_ingest_files.py` and `build/02_chunk_embed.py` to
+expose `main()` as importable callables. `handlers.py` imports them and
+runs in-process, routing their stdout/stderr through the root logger so
+the technical-log accordion still gets the same output.
+
+Drop every `sys.executable` subprocess spawn (6 sites in app.py).
+
+#### B-2 · `sys.frozen` path resolution
+```python
+if getattr(sys, 'frozen', False):
+    _PROJECT_ROOT = Path(sys.executable).parent
+else:
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+```
+Same fix in `app/logging_config.py`. **Writable paths** (data/, logs/,
+raw/quarantine/) move to `%LOCALAPPDATA%/SermonNotes/` so they persist
+across runs and don't collide with read-only `_MEIPASS`. **Bundled
+assets** (default settings template, etc.) stay under `_MEIPASS`.
+
+#### Packaging mechanics
+- `--onedir` mode (not `--onefile` — llama-cpp native libs don't bundle cleanly)
+- Hidden imports to enumerate: `faiss`, `llama_cpp`, `sentence_transformers.*`,
+  `gradio.*`, `huggingface_hub`, `pywin32`
 - Bundle the Gradio static assets (they're in the venv, not auto-detected)
-- `setup.bat` remains for fresh-install (Python + deps); PyInstaller build produces a
-  separate launcher that doesn't require Python to be installed
+- `setup.bat` remains for fresh-install (Python + deps); the PyInstaller
+  build produces a separate launcher that doesn't require Python to be
+  installed
+- First-run migration: copy any pre-existing `data/`, `logs/`, `raw/` from
+  the install dir into `%LOCALAPPDATA%/SermonNotes/`
+- Standard build: `build/make_release.bat` — runs PyInstaller, smoke test,
+  zips `dist/`
+- Smoke test corpus includes one accented-filename sermon (D-2 from review)
 
 **Target machine: CPU-only (integrated graphics, no dedicated GPU)**
 - Ship the standard CPU llama-cpp-python wheel — no CUDA dependencies to bundle
-- detect_n_gpu_layers() will correctly return 0 and the app runs on CPU
-- Standard build: `build/make_release.bat` — runs PyInstaller, smoke test, zips dist/
+- `detect_n_gpu_layers()` returns 0 and the app runs on CPU
 
 ---
 
 ## Tier 7 — Post-packaging polish
 
-### 18. Deep GUI analysis and redesign (round 2)
-- With the full feature set complete and the app running stably, do a
-  comprehensive usability and visual review against real pastoral use:
-  - Information hierarchy: does the pastor know exactly what to do on first launch?
-  - Quarantine tab: is the per-file list usable with 4,700+ entries, or does it
-    need grouping, filtering, or pagination?
-  - Typography, spacing, colour refinement — push beyond Gradio defaults toward a
-    genuinely bespoke pastoral aesthetic
-  - Accessibility: contrast ratios, keyboard navigation, label clarity
-  - Feedback from the end user after first real-world use should drive this pass
-- Effort: 2–4 hours depending on user feedback scope
-- Prerequisite: item 17 shipped and user has used the packaged build
+### 18. Deep GUI analysis and redesign (round 2) + structural split
+
+**Task 1 — Full UI-block split** (deferred from pre-delivery review D-1)
+
+Split `app/app.py` (currently ~1500 lines after the review changes) into:
+- `app/app.py` — main(), CLI, build_ui() composition, _load_components,
+  settings persistence
+- `app/ui_search.py` — search tab block builder
+- `app/ui_quarantine.py` — quarantine tab block builder
+- `app/ui_archive.py` — manage-archive tab block builder
+- `app/handlers.py` (already exists) — absorbs `_run_subprocess`,
+  `_validate_and_persist_folder`, `_build_run_summary` and friends
+
+After Item 17's B-1 in-process refactor, handlers are pure Python instead
+of subprocess orchestrators, which makes this split much cleaner.
+
+**Task 2 — Real-world UX pass**
+- Information hierarchy: does the pastor know exactly what to do on first launch?
+- Quarantine tab: is the per-file list usable with 4,700+ entries, or does it
+  need grouping, filtering, or pagination?
+- Typography, spacing, colour refinement — push beyond Gradio defaults toward a
+  genuinely bespoke pastoral aesthetic
+- Accessibility: contrast ratios, keyboard navigation, label clarity
+- Feedback from the end user after first real-world use should drive this pass
+
+**Task 3 — Deferred backlog from the pre-delivery review**
+- D-2 Non-ASCII filename round-trip empirical test
+- D-3 Long-path (>260) support — currently documented as a soft limit
+- D-4 Empty-state messaging on Search tab (`row_count=(0, "dynamic")`)
+- D-5 IndexIDMap migration for proper FAISS deletion (orphan vectors)
+- D-6 Sentence-aware truncation of long chunks in LLM context
+- D-7 Deep typography/accessibility polish
+- D-8 (None — was an unrelated nit, resolved in the docs sweep)
+
+Effort: 1–2 days depending on user feedback scope.
+Prerequisite: Item 17 shipped and pastor has used the packaged build.
 
 ---
 
