@@ -820,16 +820,19 @@ def test_batch_ignore_empty_bucket(tmp_path):
 # request_batch_action / execute_batch_action / cancel_batch_action
 # ---------------------------------------------------------------------------
 
+_CLEARED = {'action': None, 'reason': None, 'count': 0, 'filename': None}
+
+
 def test_request_batch_action_ignore_returns_pending_state():
     pending, msg, col_update = app_module.request_batch_action('ignore', 'too_short', 5)
-    assert pending == {'action': 'ignore', 'reason': 'too_short', 'count': 5}
+    assert pending == {'action': 'ignore', 'reason': 'too_short', 'count': 5, 'filename': None}
     assert '5' in msg
     assert col_update.get('visible') is True  # gr.update dict
 
 
 def test_request_batch_action_force_returns_pending_state():
     pending, msg, col_update = app_module.request_batch_action('force', 'manual_review', 10)
-    assert pending == {'action': 'force', 'reason': 'manual_review', 'count': 10}
+    assert pending == {'action': 'force', 'reason': 'manual_review', 'count': 10, 'filename': None}
     assert '10' in msg
     assert col_update.get('visible') is True
 
@@ -844,26 +847,74 @@ def test_execute_batch_action_clears_pending_and_hides_panel(tmp_path):
     bucket = root / "too_short"
     bucket.mkdir(parents=True)
     (bucket / "a.docx").write_text("x")
-    pending = {'action': 'ignore', 'reason': 'too_short', 'count': 1}
+    pending = {'action': 'ignore', 'reason': 'too_short', 'count': 1, 'filename': None}
     with mock.patch.object(app_module, '_quarantine_root', return_value=root):
         cleared, confirm_msg, col_update, result = app_module.execute_batch_action(pending)
-    assert cleared == {'action': None, 'reason': None, 'count': 0}
+    assert cleared == _CLEARED
     assert confirm_msg == ""
     assert col_update.get('visible') is False
     assert '1' in result or 'deleted' in result.lower() or '✓' in result
 
 
 def test_execute_batch_action_with_empty_pending():
-    cleared, confirm_msg, col_update, result = app_module.execute_batch_action(
-        {'action': None, 'reason': None, 'count': 0}
-    )
-    assert cleared == {'action': None, 'reason': None, 'count': 0}
+    cleared, confirm_msg, col_update, result = app_module.execute_batch_action(_CLEARED)
+    assert cleared == _CLEARED
     assert col_update.get('visible') is False
 
 
 def test_cancel_batch_action_clears_state():
     cleared, confirm_msg, col_update, result = app_module.cancel_batch_action()
-    assert cleared == {'action': None, 'reason': None, 'count': 0}
+    assert cleared == _CLEARED
     assert confirm_msg == ""
+    assert col_update.get('visible') is False
+    assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# B-6: single-file Ignore confirmation
+# ---------------------------------------------------------------------------
+
+def test_request_single_ignore_returns_pending_with_filename():
+    pending, msg, col_update = app_module.request_single_ignore(
+        'manual_review', 'sermon_2019.doc',
+    )
+    assert pending == {
+        'action': 'ignore_one',
+        'reason': 'manual_review',
+        'count': 1,
+        'filename': 'sermon_2019.doc',
+    }
+    assert 'sermon_2019.doc' in msg
+    assert 'cannot be undone' in msg.lower()
+    assert col_update.get('visible') is True
+
+
+def test_execute_batch_action_ignore_one_deletes_named_file(tmp_path):
+    """Confirming a per-file Ignore removes only that file from the bucket."""
+    root = tmp_path / "raw" / "quarantine"
+    bucket = root / "too_short"
+    bucket.mkdir(parents=True)
+    (bucket / "doomed.docx").write_text("x")
+    (bucket / "keeper.docx").write_text("x")
+    pending = {
+        'action': 'ignore_one',
+        'reason': 'too_short',
+        'count': 1,
+        'filename': 'doomed.docx',
+    }
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        cleared, _, col_update, result = app_module.execute_batch_action(pending)
+    assert cleared == _CLEARED
+    assert col_update.get('visible') is False
+    assert not (bucket / "doomed.docx").exists()
+    assert (bucket / "keeper.docx").exists()  # other files untouched
+    assert 'doomed.docx' in result.lower() or 'ignored' in result.lower()
+
+
+def test_execute_batch_action_ignore_one_missing_filename_noops():
+    """ignore_one without a filename should not crash."""
+    pending = {'action': 'ignore_one', 'reason': 'too_short', 'count': 1, 'filename': None}
+    cleared, _, col_update, result = app_module.execute_batch_action(pending)
+    assert cleared == _CLEARED
     assert col_update.get('visible') is False
     assert result == ""

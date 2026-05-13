@@ -911,6 +911,9 @@ def batch_force_ingest_quarantine(reason: str) -> str:
     return "\n".join(lines)
 
 
+_CLEAR_PENDING = {"action": None, "reason": None, "count": 0, "filename": None}
+
+
 def request_batch_action(action: str, reason: str, count: int) -> tuple:
     """Build confirmation panel content for a pending batch action.
 
@@ -934,7 +937,24 @@ def request_batch_action(action: str, reason: str, count: int) -> tuple:
                 "to the index alongside the originals."
             )
     return (
-        {"action": action, "reason": reason, "count": count},
+        {"action": action, "reason": reason, "count": count, "filename": None},
+        msg,
+        gr.update(visible=True),
+    )
+
+
+def request_single_ignore(reason: str, filename: str) -> tuple:
+    """Confirmation panel content for a single-file Ignore.
+
+    Same shape as request_batch_action so the confirm panel can be shared.
+    """
+    label = QUARANTINE_LABELS.get(reason, reason)
+    msg = (
+        f"**Delete `{filename}` from *{label}*?**\n\n"
+        "This permanently removes the file from quarantine and **cannot be undone**."
+    )
+    return (
+        {"action": "ignore_one", "reason": reason, "count": 1, "filename": filename},
         msg,
         gr.update(visible=True),
     )
@@ -944,20 +964,23 @@ def execute_batch_action(pending: dict) -> tuple:
     """Execute the confirmed batch action, then hide the confirmation panel."""
     action = pending.get("action")
     reason = pending.get("reason")
-    _clear = {"action": None, "reason": None, "count": 0}
+    filename = pending.get("filename")
     if not action or not reason:
-        return _clear, "", gr.update(visible=False), ""
-    result = (
-        batch_ignore_quarantine(reason)
-        if action == 'ignore'
-        else batch_force_ingest_quarantine(reason)
-    )
-    return _clear, "", gr.update(visible=False), result
+        return _CLEAR_PENDING, "", gr.update(visible=False), ""
+    if action == 'ignore':
+        result = batch_ignore_quarantine(reason)
+    elif action == 'force':
+        result = batch_force_ingest_quarantine(reason)
+    elif action == 'ignore_one' and filename:
+        result = ignore_quarantine_file(reason, filename)
+    else:
+        result = ""
+    return _CLEAR_PENDING, "", gr.update(visible=False), result
 
 
 def cancel_batch_action() -> tuple:
     """Dismiss the confirmation panel without doing anything."""
-    return {"action": None, "reason": None, "count": 0}, "", gr.update(visible=False), ""
+    return _CLEAR_PENDING, "", gr.update(visible=False), ""
 
 
 # ---------------------------------------------------------------------------
@@ -1237,10 +1260,12 @@ def build_ui():
                                     inputs=[],
                                     outputs=[quarantine_action_md],
                                 )
+                                # Route per-file Ignore through the same confirm panel
+                                # as batch Delete All — destructive, no undo.
                                 _ig_btn.click(
-                                    fn=lambda r=_reason, f=_fname: ignore_quarantine_file(r, f),
+                                    fn=lambda r=_reason, f=_fname: request_single_ignore(r, f),
                                     inputs=[],
-                                    outputs=[quarantine_action_md],
+                                    outputs=[quarantine_pending, confirm_msg_md, confirm_col],
                                 )
 
                 # Wire the confirm / cancel buttons (outside accordion loop — shared by all buckets)
