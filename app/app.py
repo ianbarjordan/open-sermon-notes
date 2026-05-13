@@ -747,6 +747,41 @@ _WORKING_REBUILD = (
     "Rebuilding — please wait…",
 )
 
+
+# Confirmation copy for the Full Rebuild button. The pastor must confirm
+# before this destructive multi-minute operation runs.
+def request_full_rebuild_confirmation(folder: str) -> tuple:
+    """Return (pending_folder, confirm_message, gr.update(visible=True))."""
+    if not folder or not folder.strip():
+        # Defer the friendly error to the actual handler so the message
+        # flow stays consistent.
+        return ("", "", gr.update(visible=False))
+    msg = (
+        "**Run a full rebuild of the search index?**\n\n"
+        f"This re-parses and re-indexes every sermon under *{folder.strip()}* "
+        "from scratch. On a large library it can take several minutes.\n\n"
+        "Your sermon files are not modified — only the search index is "
+        "rebuilt — but you must leave this window open while it runs."
+    )
+    return (folder.strip(), msg, gr.update(visible=True))
+
+
+def cancel_full_rebuild() -> tuple:
+    """Dismiss the rebuild confirm panel without doing anything."""
+    return "", "", gr.update(visible=False), "", ""
+
+
+def confirm_full_rebuild_with_progress(folder: str):
+    """Generator: hides the confirm panel, then runs full_rebuild_with_progress.
+
+    Yields 5-tuples: (pending_clear, confirm_msg_clear, confirm_col_hidden,
+                      archive_summary, archive_log)
+    """
+    # Hide panel, then immediately enter "Working" state.
+    yield ("", "", gr.update(visible=False), _WORKING_REBUILD[0], _WORKING_REBUILD[1])
+    summary, raw = full_rebuild(folder)
+    yield ("", "", gr.update(visible=False), summary, raw)
+
 _WORKING_UNBLOCK = (
     "⏳  **Unblocking files — please wait.**\n\n"
     "Windows is removing the security flag from every file in your library.",
@@ -1464,6 +1499,15 @@ def build_ui():
                     process_btn = gr.Button("➕  Process New Files", variant="primary")
                     rebuild_btn = gr.Button("🔄  Full Rebuild", variant="secondary")
 
+                # Rebuild confirm panel — hidden until rebuild_btn is clicked.
+                # Mirrors the Quarantine batch-confirm pattern.
+                rebuild_pending = gr.State("")
+                with gr.Column(visible=False, elem_classes=["confirm-box"]) as rebuild_confirm_col:
+                    rebuild_confirm_msg = gr.Markdown(value="")
+                    with gr.Row():
+                        rebuild_yes_btn = gr.Button("✅  Yes, rebuild", variant="primary", size="sm")
+                        rebuild_no_btn  = gr.Button("Cancel",           variant="secondary", size="sm")
+
                 archive_summary = gr.Markdown(value="")
 
                 with gr.Accordion("Technical log", open=False):
@@ -1507,8 +1551,33 @@ def build_ui():
                 # the final result — pastor sees the click register on long
                 # operations instead of an idle UI.
                 process_btn.click(fn=process_new_files_with_progress, inputs=[folder_box], outputs=archive_outputs)
-                rebuild_btn.click(fn=full_rebuild_with_progress, inputs=[folder_box], outputs=archive_outputs)
                 unblock_btn.click(fn=unblock_library_with_progress, inputs=[folder_box], outputs=archive_outputs)
+
+                # Full Rebuild: 3-step flow (request confirm → confirm → run).
+                # rebuild_btn opens the confirm panel; rebuild_yes_btn runs the
+                # generator that hides the panel and streams Working → summary.
+                _rebuild_confirm_outputs = [
+                    rebuild_pending, rebuild_confirm_msg, rebuild_confirm_col,
+                ]
+                _rebuild_run_outputs = [
+                    rebuild_pending, rebuild_confirm_msg, rebuild_confirm_col,
+                    archive_summary, archive_log,
+                ]
+                rebuild_btn.click(
+                    fn=request_full_rebuild_confirmation,
+                    inputs=[folder_box],
+                    outputs=_rebuild_confirm_outputs,
+                )
+                rebuild_yes_btn.click(
+                    fn=confirm_full_rebuild_with_progress,
+                    inputs=[rebuild_pending],
+                    outputs=_rebuild_run_outputs,
+                )
+                rebuild_no_btn.click(
+                    fn=cancel_full_rebuild,
+                    inputs=[],
+                    outputs=_rebuild_run_outputs,
+                )
                 log_btn.click(fn=open_log_folder, inputs=[], outputs=[log_status])
                 if sys.platform == 'win32':
                     browse_btn.click(fn=browse_folder, inputs=[], outputs=[folder_box])

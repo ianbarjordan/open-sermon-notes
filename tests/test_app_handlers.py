@@ -997,6 +997,47 @@ def test_unblock_library_with_progress_yields_working_first(monkeypatch):
     assert next(gen) == ("unblocked", "log")
 
 
+# ---------------------------------------------------------------------------
+# S-8: Full Rebuild confirmation flow
+# ---------------------------------------------------------------------------
+
+def test_request_full_rebuild_confirmation_shows_panel(tmp_path):
+    pending, msg, col_update = app_module.request_full_rebuild_confirmation(str(tmp_path))
+    assert pending == str(tmp_path)
+    assert 'rebuild' in msg.lower()
+    assert 'several minutes' in msg.lower() or 'minutes' in msg.lower()
+    assert col_update.get('visible') is True
+
+
+def test_request_full_rebuild_confirmation_empty_folder_hides_panel():
+    """Empty folder → defer to the actual handler's friendly error; do not show confirm."""
+    pending, msg, col_update = app_module.request_full_rebuild_confirmation("")
+    assert pending == ""
+    assert col_update.get('visible') is False
+
+
+def test_cancel_full_rebuild_returns_5tuple_hidden():
+    """Cancel clears state and hides the panel without running anything."""
+    result = app_module.cancel_full_rebuild()
+    assert len(result) == 5
+    assert result[0] == ""  # pending cleared
+    assert result[2].get('visible') is False  # panel hidden
+    assert result[3] == "" and result[4] == ""  # summary/log untouched
+
+
+def test_confirm_full_rebuild_with_progress_yields_working_then_result(monkeypatch):
+    """Generator wrapper: working state first (panel hidden), then real result."""
+    monkeypatch.setattr(app_module, 'full_rebuild', lambda f: ("Rebuild complete", "log output"))
+    gen = app_module.confirm_full_rebuild_with_progress("/some/folder")
+    first = next(gen)
+    assert len(first) == 5
+    assert first[2].get('visible') is False
+    assert '⏳' in first[3] or 'rebuild' in first[3].lower()
+    second = next(gen)
+    assert second[3] == "Rebuild complete"
+    assert second[4] == "log output"
+
+
 def test_execute_batch_action_with_progress_yields_intermediate_state(tmp_path):
     """Working state is yielded before the actual file operation completes."""
     root = tmp_path / "raw" / "quarantine"
