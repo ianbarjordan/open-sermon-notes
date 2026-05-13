@@ -1,11 +1,11 @@
 """
-01_ingest_files.py — Walk source dir, parse every file, apply quarantine pipeline,
+ingest_files.py — Walk source dir, parse every file, apply quarantine pipeline,
 write JSON to data/documents/.
 
 Usage:
-    python build/01_ingest_files.py --source SampleData/ --dry-run --verbose
-    python build/01_ingest_files.py --source SampleData/ --verbose
-    python build/01_ingest_files.py --source SampleData/ --limit 10
+    python build/ingest_files.py --source SampleData/ --dry-run --verbose
+    python build/ingest_files.py --source SampleData/ --verbose
+    python build/ingest_files.py --source SampleData/ --limit 10
 """
 import argparse
 import hashlib

@@ -1,12 +1,12 @@
 """
-02_chunk_embed.py — Read JSON docs → chunk → embed with BGE-small →
+chunk_embed.py — Read JSON docs → chunk → embed with BGE-small →
 write FAISS IndexFlatL2 + SQLite FTS5 + id_map.json.
 
 Usage:
-    python build/02_chunk_embed.py --dry-run
-    python build/02_chunk_embed.py
-    python build/02_chunk_embed.py --force
-    python build/02_chunk_embed.py --incremental
+    python build/chunk_embed.py --dry-run
+    python build/chunk_embed.py
+    python build/chunk_embed.py --force
+    python build/chunk_embed.py --incremental
 """
 import argparse
 import json

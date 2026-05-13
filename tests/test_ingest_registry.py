@@ -1,4 +1,4 @@
-"""Tests for the persistent dedup registry added in 01_ingest_files.py."""
+"""Tests for the persistent dedup registry added in build/ingest_files.py."""
 import json
 import sys
 import tempfile
@@ -6,16 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Import using the module file path to avoid the numeric prefix
-import importlib.util, os
-_spec = importlib.util.spec_from_file_location(
-    "ingest01",
-    str(Path(__file__).resolve().parent.parent / "build" / "01_ingest_files.py"),
-)
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
-load_registry = _mod.load_registry
-save_registry = _mod.save_registry
+from build.ingest_files import load_registry, save_registry  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

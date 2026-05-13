@@ -1,8 +1,7 @@
-"""Tests for 02_chunk_embed.py — incremental indexing logic.
+"""Tests for build/chunk_embed.py — incremental indexing logic.
 
 Uses in-memory FAISS and SQLite to avoid touching real data/artifacts.
 """
-import importlib.util
 import json
 import sqlite3
 import sys
@@ -14,21 +13,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Load 02_chunk_embed.py via importlib (numeric prefix workaround)
-_spec = importlib.util.spec_from_file_location(
-    "chunk_embed02",
-    str(Path(__file__).resolve().parent.parent / "build" / "02_chunk_embed.py"),
+from build.chunk_embed import (  # noqa: E402
+    init_db,
+    insert_chunk_fts,
+    insert_document_metadata,
+    build_index_incremental,
+    save_artifacts,
+    load_documents,
+    load_documents_from_db,
 )
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
-
-init_db                  = _mod.init_db
-insert_chunk_fts         = _mod.insert_chunk_fts
-insert_document_metadata = _mod.insert_document_metadata
-build_index_incremental  = _mod.build_index_incremental
-save_artifacts           = _mod.save_artifacts
-load_documents           = _mod.load_documents
-load_documents_from_db   = _mod.load_documents_from_db
 
 # Try to import faiss — skip incremental tests if not available
 try:
