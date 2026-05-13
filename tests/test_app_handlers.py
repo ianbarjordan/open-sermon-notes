@@ -656,6 +656,28 @@ def test_unblock_library_windows_failure(tmp_path):
 
     assert '⚠️' in summary
     assert 'access denied' in raw.lower()
+    # S-9: 'access denied' should trigger the Administrator-permission summary
+    assert 'administrator' in summary.lower()
+
+
+# ---------------------------------------------------------------------------
+# S-9: unblock failure-summary classifier
+# ---------------------------------------------------------------------------
+
+def test_unblock_failure_summary_access_denied_says_administrator():
+    msg = app_module._unblock_failure_summary("Access is denied. blah blah")
+    assert 'administrator' in msg.lower()
+    assert 'run as administrator' in msg.lower() or 'launch.bat' in msg.lower()
+
+
+def test_unblock_failure_summary_folder_missing_says_check_drive():
+    msg = app_module._unblock_failure_summary("Cannot find path 'D:\\foo'")
+    assert 'moved' in msg.lower() or 'drive' in msg.lower() or 'unplugged' in msg.lower()
+
+
+def test_unblock_failure_summary_unknown_points_to_log_folder():
+    msg = app_module._unblock_failure_summary("something obscure went wrong")
+    assert 'log folder' in msg.lower() or 'app.log' in msg.lower()
 
 
 # ---------------------------------------------------------------------------

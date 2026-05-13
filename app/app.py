@@ -557,7 +557,7 @@ def unblock_library(folder: str) -> tuple[str, str]:
         if result.returncode != 0:
             raw += f'\n[exit code: {result.returncode}]'
             _log.error('Unblock-File exited %d\n%s', result.returncode, raw)
-            summary = '⚠️  Unblock command finished with errors. See the technical log.'
+            summary = _unblock_failure_summary(result.stderr or result.stdout)
         else:
             summary = (
                 '✅  Files unblocked successfully.\n\n'
@@ -566,9 +566,42 @@ def unblock_library(folder: str) -> tuple[str, str]:
     except Exception as e:
         _log.error('Unblock-File failed', exc_info=True)
         raw += f'Error: {e}'
-        summary = f'⚠️  Could not run PowerShell: {e}'
+        summary = (
+            "⚠️  Couldn't run the unblock command — PowerShell may not be "
+            "available. See **logs/app.log** (click **📂 Open Log Folder** "
+            "below) for the technical details."
+        )
 
     return summary, raw
+
+
+def _unblock_failure_summary(stderr_or_stdout: str) -> str:
+    """Build a pastor-readable summary for an Unblock-File non-zero exit.
+
+    Inspects the captured output for known failure modes and gives a concrete
+    next step ('Run as Administrator', 'Folder might be locked', etc.).
+    """
+    text = (stderr_or_stdout or "").lower()
+    if any(kw in text for kw in ('access', 'denied', 'unauthorized', 'permission')):
+        return (
+            "⚠️  **Unblock failed — Administrator permission is needed.**\n\n"
+            "1. Close this window.\n"
+            "2. Right-click **launch.bat** and choose **Run as administrator**.\n"
+            "3. Try **Unblock Sermon Library** again."
+        )
+    if 'cannot find' in text or 'does not exist' in text:
+        return (
+            "⚠️  **Unblock failed — the folder may have been moved or "
+            "unplugged (e.g. external drive disconnected).**\n\n"
+            "Check that your sermon library folder is still where the path "
+            "above says it should be, then try again."
+        )
+    return (
+        "⚠️  **Unblock finished with errors.**\n\n"
+        "Click **📂 Open Log Folder** below and check `app.log` — the "
+        "technical reason is recorded there. If you can't tell what went "
+        "wrong, try running launch.bat as Administrator and unblocking again."
+    )
 
 
 # ---------------------------------------------------------------------------
