@@ -25,6 +25,9 @@ from app.config import (  # noqa: E402
     SERMON_ROOT,
     TOP_K,
 )
+from app.logging_config import get_logger  # noqa: E402
+
+_log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -211,18 +214,18 @@ def load_retriever(
     from sentence_transformers import SentenceTransformer
 
     index = faiss.read_index(faiss_path)
-    print(f"Loaded FAISS index: {index.ntotal} vectors from {faiss_path!r}")
+    _log.info("Loaded FAISS index: %d vectors from %r", index.ntotal, faiss_path)
 
     with open(idmap_path, encoding='utf-8') as fh:
         raw_map = json.load(fh)
     id_map = {int(k): v for k, v in raw_map.items()}
-    print(f"Loaded id_map: {len(id_map)} entries")
+    _log.info("Loaded id_map: %d entries", len(id_map))
 
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
 
     model = SentenceTransformer(model_name)
-    print(f"Loaded embedding model: {model_name!r}")
+    _log.info("Loaded embedding model: %r", model_name)
 
     return Retriever(index=index, id_map=id_map, conn=conn, model=model,
                      sermon_root=sermon_root)

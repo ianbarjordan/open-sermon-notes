@@ -212,9 +212,9 @@ def load_llm(model_path: str = MODEL_PATH) -> LLM:
 
     n_gpu = detect_n_gpu_layers()
     if n_gpu > 0:
-        print(f"GPU acceleration enabled — offloading {n_gpu} layers to GPU")
+        _log.info("GPU acceleration enabled — offloading %d layers to GPU", n_gpu)
     else:
-        print("Running on CPU (no compatible GPU detected)")
+        _log.info("Running on CPU (no compatible GPU detected)")
 
     llama = Llama(
         model_path=model_path,
