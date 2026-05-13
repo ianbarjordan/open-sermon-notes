@@ -176,8 +176,8 @@ def detect_n_gpu_layers() -> int:
         else:
             _log.info("torch.cuda reports no CUDA device — using CPU")
             return 0
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("torch.cuda probe failed: %s", e, exc_info=True)
 
     _log.info("GPU detection inconclusive — defaulting to CPU (N_GPU_LAYERS=0)")
     return 0

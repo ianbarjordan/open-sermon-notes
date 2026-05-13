@@ -55,8 +55,11 @@ def load_settings() -> dict:
         try:
             with open(p, encoding='utf-8') as fh:
                 return json.load(fh)
-        except Exception:
-            pass
+        except Exception as e:
+            get_logger(__name__).warning(
+                "Could not read settings file %s: %s — using defaults.",
+                p, e, exc_info=True,
+            )
     return {}
 
 
@@ -66,8 +69,11 @@ def save_settings(settings: dict) -> None:
     try:
         with open(p, 'w', encoding='utf-8') as fh:
             json.dump(settings, fh, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        get_logger(__name__).warning(
+            "Could not write settings file %s: %s — change will not persist.",
+            p, e, exc_info=True,
+        )
 
 
 def _load_components(
@@ -519,7 +525,11 @@ def browse_folder() -> str:
             capture_output=True, text=True, timeout=120,
         )
         return result.stdout.strip()
-    except Exception:
+    except Exception as e:
+        get_logger(__name__).warning(
+            "Folder picker subprocess failed: %s — user will need to paste the path manually.",
+            e, exc_info=True,
+        )
         return ''
 
 
@@ -752,8 +762,12 @@ def force_ingest_file(reason: str, filename: str) -> str:
     try:
         src.unlink()
         lines.append(f"Removed from quarantine/{reason}/.")
-    except Exception:
-        pass
+    except Exception as e:
+        get_logger(__name__).warning(
+            "Could not remove quarantined file after processing %s: %s — "
+            "file remains in quarantine but is harmless.",
+            src, e, exc_info=True,
+        )
 
     return "\n".join(lines)
 
@@ -863,8 +877,11 @@ def batch_force_ingest_quarantine(reason: str) -> str:
             if f.exists():
                 f.unlink()
                 removed += 1
-        except Exception:
-            pass
+        except Exception as e:
+            get_logger(__name__).warning(
+                "Could not remove quarantined file %s after batch ingest: %s",
+                f, e, exc_info=True,
+            )
     lines.append(f"Removed {removed} file(s) from quarantine/{reason}/.")
     return "\n".join(lines)
 

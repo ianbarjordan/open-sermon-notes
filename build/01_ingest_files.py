@@ -140,13 +140,22 @@ def _get_win_word_app():
 
 
 def _close_win_word_app() -> None:
-    """Quit the persistent Word COM instance if active."""
+    """Quit the persistent Word COM instance if active.
+
+    A Word.Quit() failure here is non-fatal — the OS will reap the COM
+    server on process exit — but we surface it on stderr so the cause
+    is visible in the technical log if it ever matters.
+    """
     global _WIN_WORD_APP
     if _WIN_WORD_APP is not None:
         try:
             _WIN_WORD_APP.Quit()
-        except Exception:
-            pass
+        except Exception as e:
+            print(
+                f"[warning] Word COM Quit() failed: {e} "
+                "(non-fatal — OS will reap the COM server)",
+                file=sys.stderr,
+            )
         _WIN_WORD_APP = None
 
 
