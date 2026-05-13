@@ -681,6 +681,73 @@ def full_rebuild(folder: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Progress-aware wrappers (Gradio generators)
+#
+# Each wrapper yields an immediate "Working..." state so the pastor sees the
+# click register, then yields the final result. The underlying tuple-returning
+# functions are unchanged and remain unit-testable.
+# ---------------------------------------------------------------------------
+
+_WORKING_PROCESS = (
+    "⏳  **Working — this may take several minutes for a large library.**\n\n"
+    "Please leave this window open. The browser may look idle while files "
+    "are parsed and indexed.",
+    "Working — please wait…",
+)
+
+_WORKING_REBUILD = (
+    "⏳  **Full rebuild in progress — this can take several minutes.**\n\n"
+    "Every sermon is being re-parsed and re-indexed from scratch. "
+    "Please leave this window open until the summary appears below.",
+    "Rebuilding — please wait…",
+)
+
+_WORKING_UNBLOCK = (
+    "⏳  **Unblocking files — please wait.**\n\n"
+    "Windows is removing the security flag from every file in your library.",
+    "Unblocking — please wait…",
+)
+
+
+def process_new_files_with_progress(folder: str):
+    """Generator wrapper around process_new_files for Gradio button wiring."""
+    yield _WORKING_PROCESS
+    yield process_new_files(folder)
+
+
+def full_rebuild_with_progress(folder: str):
+    """Generator wrapper around full_rebuild for Gradio button wiring."""
+    yield _WORKING_REBUILD
+    yield full_rebuild(folder)
+
+
+def unblock_library_with_progress(folder: str):
+    """Generator wrapper around unblock_library for Gradio button wiring."""
+    yield _WORKING_UNBLOCK
+    yield unblock_library(folder)
+
+
+def execute_batch_action_with_progress(pending: dict):
+    """Generator wrapper around execute_batch_action for the confirm-Yes button.
+
+    Yields a 'Working...' state immediately so the pastor sees the click
+    register, then yields the final 4-tuple from execute_batch_action.
+    """
+    action = pending.get("action") if isinstance(pending, dict) else None
+    if action == 'force':
+        working_msg = "⏳  Copying files, re-indexing, and reloading search — please wait…"
+    elif action == 'ignore':
+        working_msg = "⏳  Deleting files from quarantine — please wait…"
+    elif action == 'ignore_one':
+        working_msg = "⏳  Deleting file — please wait…"
+    else:
+        working_msg = "⏳  Working…"
+    # Mid-flight: keep pending state intact, hide panel, show working message
+    yield (pending, "", gr.update(visible=False), working_msg)
+    yield execute_batch_action(pending)
+
+
+# ---------------------------------------------------------------------------
 # Quarantine management handlers
 # ---------------------------------------------------------------------------
 
@@ -1281,7 +1348,7 @@ def build_ui():
                 # Wire the confirm / cancel buttons (outside accordion loop — shared by all buckets)
                 _confirm_outputs = [quarantine_pending, confirm_msg_md, confirm_col, quarantine_action_md]
                 confirm_yes_btn.click(
-                    fn=execute_batch_action,
+                    fn=execute_batch_action_with_progress,
                     inputs=[quarantine_pending],
                     outputs=_confirm_outputs,
                 )
@@ -1391,9 +1458,12 @@ def build_ui():
 
                 # Event wiring (unchanged)
                 archive_outputs = [archive_summary, archive_log]
-                process_btn.click(fn=process_new_files, inputs=[folder_box], outputs=archive_outputs)
-                rebuild_btn.click(fn=full_rebuild, inputs=[folder_box], outputs=archive_outputs)
-                unblock_btn.click(fn=unblock_library, inputs=[folder_box], outputs=archive_outputs)
+                # Generator wrappers yield an immediate "Working..." state, then
+                # the final result — pastor sees the click register on long
+                # operations instead of an idle UI.
+                process_btn.click(fn=process_new_files_with_progress, inputs=[folder_box], outputs=archive_outputs)
+                rebuild_btn.click(fn=full_rebuild_with_progress, inputs=[folder_box], outputs=archive_outputs)
+                unblock_btn.click(fn=unblock_library_with_progress, inputs=[folder_box], outputs=archive_outputs)
                 log_btn.click(fn=open_log_folder, inputs=[], outputs=[log_status])
                 if sys.platform == 'win32':
                     browse_btn.click(fn=browse_folder, inputs=[], outputs=[folder_box])

@@ -952,3 +952,55 @@ def test_validate_folder_accepts_normal_path(tmp_path, monkeypatch):
     result = app_module._validate_and_persist_folder(str(tmp_path))
     assert result == (None, None)
     assert saved.get('sermon_library_folder') == str(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# S-1: progress wrappers — generators that yield "Working..." before the
+# real result so the pastor sees long-running clicks register immediately.
+# ---------------------------------------------------------------------------
+
+def test_process_new_files_with_progress_yields_working_first(monkeypatch):
+    monkeypatch.setattr(app_module, 'process_new_files', lambda f: ("done", "log"))
+    gen = app_module.process_new_files_with_progress("/some/folder")
+    first = next(gen)
+    assert isinstance(first, tuple) and len(first) == 2
+    assert 'working' in first[0].lower() or '⏳' in first[0]
+    second = next(gen)
+    assert second == ("done", "log")
+
+
+def test_full_rebuild_with_progress_yields_working_first(monkeypatch):
+    monkeypatch.setattr(app_module, 'full_rebuild', lambda f: ("rebuilt", "log"))
+    gen = app_module.full_rebuild_with_progress("/some/folder")
+    first = next(gen)
+    assert 'rebuild' in first[0].lower() or '⏳' in first[0]
+    assert next(gen) == ("rebuilt", "log")
+
+
+def test_unblock_library_with_progress_yields_working_first(monkeypatch):
+    monkeypatch.setattr(app_module, 'unblock_library', lambda f: ("unblocked", "log"))
+    gen = app_module.unblock_library_with_progress("/some/folder")
+    first = next(gen)
+    assert 'unblock' in first[0].lower() or '⏳' in first[0]
+    assert next(gen) == ("unblocked", "log")
+
+
+def test_execute_batch_action_with_progress_yields_intermediate_state(tmp_path):
+    """Working state is yielded before the actual file operation completes."""
+    root = tmp_path / "raw" / "quarantine"
+    bucket = root / "too_short"
+    bucket.mkdir(parents=True)
+    (bucket / "a.docx").write_text("x")
+    pending = {'action': 'ignore', 'reason': 'too_short', 'count': 1, 'filename': None}
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        gen = app_module.execute_batch_action_with_progress(pending)
+        first = next(gen)
+        # Mid-flight: pending kept intact, panel hidden, working message in 4th slot
+        assert first[0] == pending
+        assert first[3].lower().startswith('⏳') or 'working' in first[3].lower()
+        # File still exists at this point
+        assert (bucket / "a.docx").exists()
+        # Run to completion
+        final = next(gen)
+        assert final[0] == _CLEARED
+        assert not (bucket / "a.docx").exists()
