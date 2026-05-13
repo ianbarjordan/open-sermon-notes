@@ -30,6 +30,7 @@ from app.config import (  # noqa: E402
     SETTINGS_PATH,
     TOP_K,
 )
+from app.handlers import reload_retriever  # noqa: E402
 from app.logging_config import get_logger, log_dir, setup_logging  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -713,17 +714,11 @@ def process_new_files(folder: str) -> tuple[str, str]:
     raw += _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--incremental"])
 
     raw += "\n\n--- Reloading retriever ---\n"
-    try:
-        from app.retriever import load_retriever
+    new_retriever, msg = reload_retriever(folder.strip())
+    if new_retriever is not None:
         global _retriever
-        _retriever = load_retriever(
-            db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH,
-            sermon_root=folder.strip(),
-        )
-        raw += "Retriever reloaded successfully.\n"
-    except Exception as e:
-        raw += f"Retriever reload failed: {e}\n"
-        get_logger(__name__).error("Retriever reload failed", exc_info=True)
+        _retriever = new_retriever
+    raw += msg + "\n"
 
     summary = _build_run_summary(raw, operation='Processing')
     return summary, raw
@@ -746,17 +741,11 @@ def full_rebuild(folder: str) -> tuple[str, str]:
     raw += _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--force"])
 
     raw += "\n\n--- Reloading retriever ---\n"
-    try:
-        from app.retriever import load_retriever
+    new_retriever, msg = reload_retriever(folder)
+    if new_retriever is not None:
         global _retriever
-        _retriever = load_retriever(
-            db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH,
-            sermon_root=folder,
-        )
-        raw += "Retriever reloaded successfully.\n"
-    except Exception as e:
-        raw += f"Retriever reload failed: {e}\n"
-        get_logger(__name__).error("Retriever reload failed", exc_info=True)
+        _retriever = new_retriever
+    raw += msg + "\n"
 
     summary = _build_run_summary(raw, operation='Rebuild')
     return summary, raw
@@ -966,16 +955,11 @@ def force_ingest_file(reason: str, filename: str) -> str:
     lines.append(raw2.strip())
 
     # Reload retriever
-    try:
-        from app.retriever import load_retriever
+    new_retriever, msg = reload_retriever(library)
+    if new_retriever is not None:
         global _retriever
-        _retriever = load_retriever(
-            db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH,
-            sermon_root=library,
-        )
-        lines.append("\nRetriever reloaded.")
-    except Exception as e:
-        lines.append(f"\nRetriever reload failed: {e}")
+        _retriever = new_retriever
+    lines.append("\n" + msg)
 
     # Remove from quarantine now that it's been processed
     try:
@@ -1079,16 +1063,11 @@ def batch_force_ingest_quarantine(reason: str) -> str:
     raw2 = _run_subprocess([sys.executable, "build/02_chunk_embed.py", "--incremental"])
     lines.append("\n--- Embed ---\n" + raw2.strip())
 
-    try:
-        from app.retriever import load_retriever
+    new_retriever, msg = reload_retriever(library)
+    if new_retriever is not None:
         global _retriever
-        _retriever = load_retriever(
-            db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH,
-            sermon_root=library,
-        )
-        lines.append("\nRetriever reloaded.")
-    except Exception as e:
-        lines.append(f"\nRetriever reload failed: {e}")
+        _retriever = new_retriever
+    lines.append("\n" + msg)
 
     removed = 0
     for f in files:
