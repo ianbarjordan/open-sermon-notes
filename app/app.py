@@ -105,10 +105,22 @@ def _load_components(
         _llm = load_llm(model_path=model)
         llm_status = "LLM: loaded"
     except FileNotFoundError as e:
-        llm_status = f"LLM: model not found — {e}"
+        # The summarising model is a ~2.4 GB download that setup.bat handles.
+        # If it's missing the pastor needs a concrete recovery step, not a
+        # bare FileNotFoundError.
+        llm_status = (
+            f"LLM model file not found at: {model}\n"
+            "  Re-run setup.bat to download the model (~2.4 GB, one-time).\n"
+            "  Search will still work without it — only the AI summary is "
+            "unavailable until the file is present."
+        )
         _log.warning("LLM model file not found: %s", e)
     except Exception as e:
-        llm_status = f"LLM ERROR: {e}"
+        llm_status = (
+            f"LLM failed to load: {type(e).__name__}\n"
+            "  See logs/app.log for details. Search will work without the "
+            "summary; re-run setup.bat if the problem persists."
+        )
         _log.error("LLM failed to load", exc_info=True)
 
     return ret_status, llm_status
