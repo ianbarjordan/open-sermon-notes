@@ -113,9 +113,12 @@ class LLM:
             max_tokens=max_tokens,
             temperature=temperature,
             stream=False,
-            # Explicitly stop before the model tries to hallucinate 
-            # new questions or repeats instructions.
-            stop=["<|user|>", "<|system|>", "<|end|>", "Question:", "---"],
+            # Phi-3.5's native turn-boundary tokens are sufficient. Earlier
+            # versions included "Question:" and "---" as guard stops, but both
+            # appear naturally in sermon text ("Question: where does grace
+            # come from?" / markdown-style dividers) and were cutting answers
+            # off mid-stream.
+            stop=["<|user|>", "<|system|>", "<|end|>"],
         )
         content = response['choices'][0]['message']['content'].strip()
         # Strip any redundant "Answer:" prefix the model might have echoed

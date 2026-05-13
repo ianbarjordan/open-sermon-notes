@@ -116,3 +116,26 @@ def test_build_user_message_limits_chunks():
     msg = llm_module._build_user_message("grace", chunks)
     # Should contain at most _LLM_MAX_CHUNKS excerpts
     assert msg.count('### EXCERPT START ###') <= llm_module._LLM_MAX_CHUNKS
+
+
+# ---------------------------------------------------------------------------
+# Stop tokens (B-3): "Question:" and "---" appear in real sermon text and
+# were cutting answers off mid-stream. Verify they are NOT in the stop list.
+# ---------------------------------------------------------------------------
+
+def test_stop_tokens_exclude_natural_text_strings():
+    """Read llm.py source and confirm the stop list contains only Phi-3.5
+    turn-boundary tokens — never strings that occur in real sermon text."""
+    src = Path(llm_module.__file__).read_text(encoding='utf-8')
+    # Find the stop=[...] argument
+    import re
+    m = re.search(r'stop=\[([^\]]*)\]', src)
+    assert m is not None, "Could not locate stop=[] in llm.py"
+    stop_block = m.group(1)
+    assert '"Question:"' not in stop_block, \
+        "'Question:' must not be a stop token — it appears in real sermon text"
+    assert '"---"' not in stop_block, \
+        "'---' must not be a stop token — markdown dividers appear in sermon notes"
+    # Sanity: the legitimate Phi-3.5 tokens are still present
+    assert '<|user|>' in stop_block
+    assert '<|end|>' in stop_block
