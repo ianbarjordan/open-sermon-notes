@@ -23,6 +23,7 @@ from app.config import (  # noqa: E402
     ID_MAP_PATH,
     LOW_CONFIDENCE_THRESHOLD,
     MAX_TOP_K,
+    MAX_VISIBLE_ROWS,
     MODEL_PATH,
     QUARANTINE_LABELS,
     QUARANTINE_ROOT,
@@ -165,6 +166,9 @@ def _slice_chunks(all_chunks: list, top_k: int) -> tuple[list, str]:
         if c.get('score', 0) >= AUTO_EXPAND_THRESHOLD
     ]
     visible = base + expanded
+    # Hard cap so the pastor never sees a 50-row wall of text.
+    visible = visible[:MAX_VISIBLE_ROWS]
+    expanded = visible[min_results:]  # recompute to match capped slice
 
     if not visible:
         return [], ""
@@ -1285,7 +1289,7 @@ def build_ui():
                     search_btn = gr.Button("Search", variant="primary", scale=3)
                     top_k_slider = gr.Slider(
                         minimum=1,
-                        maximum=MAX_TOP_K,
+                        maximum=MAX_VISIBLE_ROWS,
                         value=TOP_K,
                         step=1,
                         label="Min. results",
@@ -1306,12 +1310,12 @@ def build_ui():
                     label="Matching Passages  —  click a row to open the source file",
                     wrap=True,
                     elem_classes=["passages-table"],
-                    row_count=(MAX_TOP_K, "fixed"),
+                    row_count=(MAX_VISIBLE_ROWS, "fixed"),
                 )
 
                 with gr.Row():
                     result_num = gr.Number(
-                        value=1, minimum=1, maximum=MAX_TOP_K, step=1,
+                        value=1, minimum=1, maximum=MAX_VISIBLE_ROWS, step=1,
                         label="Row", scale=1,
                     )
                     open_btn = gr.Button("📖  Open File", scale=2)

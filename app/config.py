@@ -26,7 +26,10 @@ USE_MMAP            = True
 # Retrieval
 # ---------------------------------------------------------------------------
 TOP_K               = 5        # Default (minimum) number of chunks shown
-MAX_TOP_K           = 50       # Slider ceiling — user can request up to this many results
+MAX_TOP_K           = 50       # Internal retrieval pool size — auto-expansion ranks across this
+                                # many candidates even when the slider asks for fewer
+MAX_VISIBLE_ROWS    = 20       # Hard cap on rows shown in the results table — the pastor never
+                                # sees a 50-row wall of text; auto-expansion is bounded here
 RRF_K               = 60       # Reciprocal Rank Fusion constant
 NPROBE              = 64       # FAISS IVF probe count (higher = slower but more accurate)
 CONFIDENCE_THRESHOLD = 0.005   # Minimum RRF score to include a result (RRF max ~0.033 with K=60)

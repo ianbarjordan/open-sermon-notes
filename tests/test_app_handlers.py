@@ -173,6 +173,19 @@ def test_handle_query_slider_sets_minimum():
     assert len(state) == 5  # full pool stored in state
 
 
+def test_slice_chunks_caps_visible_at_MAX_VISIBLE_ROWS():
+    """Auto-expansion must not push the visible list above MAX_VISIBLE_ROWS."""
+    from app.config import AUTO_EXPAND_THRESHOLD, MAX_VISIBLE_ROWS
+    high = AUTO_EXPAND_THRESHOLD + 0.005
+    # 50 high-confidence chunks — every single one qualifies for expansion
+    chunks = _make_chunks(50, score=high)
+    visible, _status = app_module._slice_chunks(chunks, top_k=1)
+    assert len(visible) == MAX_VISIBLE_ROWS, (
+        f"_slice_chunks returned {len(visible)} rows — must cap at "
+        f"MAX_VISIBLE_ROWS={MAX_VISIBLE_ROWS} so the pastor never sees a wall of text"
+    )
+
+
 def test_handle_query_auto_expand_status():
     """Status line mentions auto-expansion when extra high-confidence results are added."""
     from app.config import AUTO_EXPAND_THRESHOLD
