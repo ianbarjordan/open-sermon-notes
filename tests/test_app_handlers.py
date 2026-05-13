@@ -69,7 +69,9 @@ def test_handle_query_whitespace_only():
 def test_handle_query_no_retriever():
     app_module._retriever = None
     answer, rows, status, state = app_module.handle_query("grace", 5)
-    assert "not available" in answer.lower() or "retriever" in answer.lower()
+    # Sanitized message points to log folder + setup recovery path
+    assert "search index" in answer.lower() or "log folder" in answer.lower()
+    assert "setup.bat" in answer.lower() or "app.log" in answer.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +245,11 @@ def test_handle_query_retriever_exception():
     app_module._retriever = mock_retriever
 
     answer, rows, status, state = app_module.handle_query("grace", 5)
-    assert 'error' in answer.lower() or 'error' in status.lower()
+    # Sanitized: no internal noun ("FAISS") leaks to the UI; pastor gets a
+    # log-folder pointer instead.
+    assert 'FAISS' not in answer
+    assert 'something went wrong' in answer.lower() or 'log folder' in answer.lower()
+    assert 'failed' in status.lower() or 'logs' in status.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +368,10 @@ def test_on_row_select_file_not_on_disk(tmp_path):
     chunks = [{'source_file': str(missing), 'title': 'Test'}]
     evt = _make_select_event(0)
     result = app_module.on_row_select(evt, chunks)
-    assert 'not found' in result.lower() or 'could not' in result.lower()
+    # Sanitized: 'Couldn't open the file — it may have been moved or renamed.'
+    assert "couldn't" in result.lower() or 'moved' in result.lower()
+    # Still names the expected path so the pastor can find it on disk
+    assert str(missing) in result or 'Sermon.docx' in result
 
 
 def test_on_row_select_opens_file_linux(tmp_path):
@@ -465,14 +474,17 @@ def test_open_file_out_of_range():
 def test_open_file_missing_source():
     chunks = [{'source_file': '', 'title': 'Test'}]
     result = app_module.open_file(1, chunks)
-    assert 'no file' in result.lower() or 'path' in result.lower()
+    assert 'no source' in result.lower() or 'source file' in result.lower()
 
 
 def test_open_file_file_not_on_disk(tmp_path):
     missing = tmp_path / "nope" / "Sermon.docx"
     chunks = [{'source_file': str(missing), 'title': 'Test'}]
     result = app_module.open_file(1, chunks)
-    assert 'not found' in result.lower()
+    # Sanitized: "Couldn't open the file — it may have been moved or renamed."
+    assert "couldn't" in result.lower() or 'moved' in result.lower()
+    # Still surfaces the expected path so the pastor can locate the file.
+    assert str(missing) in result or 'Sermon.docx' in result
 
 
 def test_open_file_opens_on_linux(tmp_path):

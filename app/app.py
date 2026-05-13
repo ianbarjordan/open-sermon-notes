@@ -212,13 +212,24 @@ def handle_query(query: str, top_k: int = TOP_K):
         return (_NO_LIBRARY_MSG, [], "Set your sermon library folder first.", [])
 
     if _retriever is None:
-        return ("Retriever is not available. Check startup logs.", [], "Error: retriever not loaded", [])
+        return (
+            "The search index isn't ready. Click **📂 Open Log Folder** on the "
+            "Manage Archive tab and check `app.log` for details, or re-run "
+            "setup.bat if the problem persists.",
+            [], "Search index not loaded", [],
+        )
 
     try:
         # Always fetch the full MAX_TOP_K pool so auto-expansion has candidates to draw from
         all_chunks = _retriever.search(query, top_k=MAX_TOP_K)
     except Exception as e:
-        return (f"Retrieval error: {e}", [], f"Error: {e}", [])
+        get_logger(__name__).error("Retrieval failed for query %r", query, exc_info=True)
+        return (
+            "Something went wrong while searching. Click **📂 Open Log Folder** "
+            "on the Manage Archive tab and check `app.log` for the technical "
+            "details.",
+            [], "Search failed — see logs.", [],
+        )
 
     if not all_chunks:
         return ("No relevant sermons found for this query.", [], "0 results", [])
@@ -229,12 +240,20 @@ def handle_query(query: str, top_k: int = TOP_K):
     if _llm is not None:
         try:
             answer = _llm.generate(query, visible)
-        except Exception as e:
-            answer = f"(LLM error: {e})\n\nTop result: {visible[0].get('text', '')[:300]}"
+        except Exception:
+            get_logger(__name__).error("LLM generate() failed for query %r", query, exc_info=True)
+            top = visible[0]
+            answer = (
+                "_The summarising model couldn't generate an answer this time. "
+                "Top match shown below; see `app.log` for details._\n\n"
+                f"**{top.get('title', '(untitled)')}** "
+                f"({top.get('scripture_ref', '')})\n\n"
+                f"{top.get('text', '')[:500]}..."
+            )
     else:
         top = visible[0]
         answer = (
-            f"**Note:** LLM not loaded — showing top match only.\n\n"
+            f"**Note:** the summarising model is not loaded — showing the top match instead.\n\n"
             f"**{top.get('title', '(untitled)')}** "
             f"({top.get('scripture_ref', '')})\n\n"
             f"{top.get('text', '')[:500]}..."
@@ -290,10 +309,13 @@ def on_row_select(evt: "gradio.SelectData", chunks_state: list) -> str:
         return "No result selected."
     source = chunks_state[row_index].get('source_file', '')
     if not source:
-        return "Source file path not available."
+        return "No source file recorded for this result."
     path = Path(source).resolve()
     if not path.exists():
-        return f"File not found: {path}"
+        return (
+            f"Couldn't open the file — it may have been moved or renamed.\n"
+            f"Expected at: {path}"
+        )
     try:
         if sys.platform == 'win32':
             os.startfile(str(path))
@@ -303,7 +325,11 @@ def on_row_select(evt: "gradio.SelectData", chunks_state: list) -> str:
             subprocess.run(['xdg-open', str(path)], check=True)
         return f"Opened: {path.name}"
     except Exception as e:
-        return f"Could not open file: {e}"
+        get_logger(__name__).error("Could not open file %s", path, exc_info=True)
+        return (
+            "Couldn't open the file — see `app.log` (📂 Open Log Folder on "
+            "the Manage Archive tab) for the technical reason."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +345,13 @@ def open_file(result_num: int, chunks_state: list) -> str:
         return f"Result #{int(result_num)} does not exist ({len(chunks_state)} results)."
     source = chunks_state[idx].get('source_file', '')
     if not source:
-        return "No file path for this result."
+        return "No source file recorded for this result."
     path = Path(source).resolve()
     if not path.exists():
-        return f"File not found: {path}"
+        return (
+            f"Couldn't open the file — it may have been moved or renamed.\n"
+            f"Expected at: {path}"
+        )
     try:
         if sys.platform == 'win32':
             os.startfile(str(path))
@@ -332,7 +361,11 @@ def open_file(result_num: int, chunks_state: list) -> str:
             subprocess.run(['xdg-open', str(path)], check=True)
         return f"Opened: {path.name}"
     except Exception as e:
-        return f"Could not open file: {e}"
+        get_logger(__name__).error("Could not open file %s", path, exc_info=True)
+        return (
+            "Couldn't open the file — see `app.log` (📂 Open Log Folder on "
+            "the Manage Archive tab) for the technical reason."
+        )
 
 
 # ---------------------------------------------------------------------------
