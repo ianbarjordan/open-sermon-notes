@@ -386,7 +386,7 @@ def save_artifacts(index, id_map: dict, faiss_path: str, idmap_path: str) -> Non
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='Chunk + embed documents and build FAISS + FTS5 index.'
     )
@@ -408,8 +408,15 @@ def main() -> None:
                         help='Chunk/count only, no writes')
     parser.add_argument('--incremental', action='store_true',
                         help='Append only new documents to existing index')
-    args = parser.parse_args()
+    return parser
 
+
+def run(args: argparse.Namespace) -> int:
+    """Execute the chunk+embed pipeline. Caller passes a parsed Namespace.
+
+    Returns 0 on success. All output goes to stdout — in-process callers
+    should redirect sys.stdout before invoking.
+    """
     docs = load_documents(args.docs)
     if not docs:
         print(f"No JSON docs found in {args.docs!r} — falling back to documents table in {args.db!r}")
@@ -425,7 +432,7 @@ def main() -> None:
                 chunks = chunk_document(text, COMMENTARY_CHUNK_WORDS, MIN_CHUNK_WORDS)
                 total_chunks += len(chunks)
         print(f"Total chunks would be: {total_chunks}")
-        return
+        return 0
 
     # Load embedding model
     print(f"Loading embedding model: {args.model}")
@@ -482,7 +489,7 @@ def main() -> None:
             if not new_docs:
                 print("Index is already up to date. Nothing to add.")
                 conn.close()
-                return
+                return 0
 
             index, id_map = build_index_incremental(
                 new_docs, stale_doc_ids, model, conn, existing_index, existing_id_map, args.batch
@@ -491,7 +498,7 @@ def main() -> None:
         save_artifacts(index, id_map, args.faiss, args.idmap)
         conn.close()
         print("Done (incremental).")
-        return
+        return 0
 
     # Full build (default)
     conn = init_db(args.db, force=args.force)
@@ -499,7 +506,14 @@ def main() -> None:
     save_artifacts(index, id_map, args.faiss, args.idmap)
     conn.close()
     print("Done.")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. argv=None reads from sys.argv as usual."""
+    args = build_parser().parse_args(argv)
+    return run(args)
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
