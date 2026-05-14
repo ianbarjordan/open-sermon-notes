@@ -184,8 +184,12 @@ def embed_chunks(texts: list[str], model, batch_size: int = 64):
 # Core build
 # ---------------------------------------------------------------------------
 
-def build_index(docs: list[dict], model, conn: sqlite3.Connection, batch_size: int):
-    """Chunk, embed, insert into FTS5, return (faiss_index, id_map)."""
+def build_index(docs: list[dict], model, conn: sqlite3.Connection, batch_size: int,
+                progress: bool = True):
+    """Chunk, embed, insert into FTS5, return (faiss_index, id_map).
+
+    progress=False suppresses tqdm — used when stdout is captured in-process.
+    """
     import faiss
     import numpy as np
 
@@ -215,11 +219,13 @@ def build_index(docs: list[dict], model, conn: sqlite3.Connection, batch_size: i
 
     # Embed
     print(f"Embedding with {EMBED_MODEL} (batch={batch_size})...")
-    try:
-        from tqdm import tqdm
-        bar = tqdm(total=len(all_texts), unit='chunk')
-    except ImportError:
-        bar = None
+    bar = None
+    if progress:
+        try:
+            from tqdm import tqdm
+            bar = tqdm(total=len(all_texts), unit='chunk')
+        except ImportError:
+            pass
 
     import numpy as np
     all_vecs_list = []
@@ -289,10 +295,12 @@ def build_index_incremental(
     existing_index,
     existing_id_map: dict,
     batch_size: int,
+    progress: bool = True,
 ) -> tuple:
     """Append-only update: embed new_docs and add to existing FAISS + FTS5.
 
     If stale_doc_ids is provided, these are removed from SQLite before adding.
+    progress=False suppresses tqdm (used when stdout is captured in-process).
     """
     import numpy as np
 
@@ -327,11 +335,13 @@ def build_index_incremental(
         return existing_index, id_map
 
     print(f"Embedding with {EMBED_MODEL} (batch={batch_size})...")
-    try:
-        from tqdm import tqdm
-        bar = tqdm(total=len(all_texts), unit='chunk')
-    except ImportError:
-        bar = None
+    bar = None
+    if progress:
+        try:
+            from tqdm import tqdm
+            bar = tqdm(total=len(all_texts), unit='chunk')
+        except ImportError:
+            pass
 
     all_vecs_list = []
     for i in range(0, len(all_texts), batch_size):
@@ -408,6 +418,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Chunk/count only, no writes')
     parser.add_argument('--incremental', action='store_true',
                         help='Append only new documents to existing index')
+    parser.add_argument('--no-progress', action='store_true',
+                        help='Suppress tqdm progress bars (in-process callers '
+                             'should set this so a captured stdout buffer does '
+                             'not fill with carriage-returned progress lines)')
     return parser
 
 
@@ -445,10 +459,11 @@ def run(args: argparse.Namespace) -> int:
         faiss_file = Path(args.faiss)
         idmap_file = Path(args.idmap)
 
+        _progress = not getattr(args, 'no_progress', False)
         if not faiss_file.exists() or not idmap_file.exists():
             print("No existing index found — falling back to full build.")
             conn = init_db(args.db, force=False)
-            index, id_map = build_index(docs, model, conn, args.batch)
+            index, id_map = build_index(docs, model, conn, args.batch, progress=_progress)
         else:
             # Load existing artifacts
             existing_index = faiss.read_index(str(faiss_file))
@@ -492,7 +507,8 @@ def run(args: argparse.Namespace) -> int:
                 return 0
 
             index, id_map = build_index_incremental(
-                new_docs, stale_doc_ids, model, conn, existing_index, existing_id_map, args.batch
+                new_docs, stale_doc_ids, model, conn, existing_index, existing_id_map,
+                args.batch, progress=_progress,
             )
 
         save_artifacts(index, id_map, args.faiss, args.idmap)
@@ -501,8 +517,9 @@ def run(args: argparse.Namespace) -> int:
         return 0
 
     # Full build (default)
+    _progress = not getattr(args, 'no_progress', False)
     conn = init_db(args.db, force=args.force)
-    index, id_map = build_index(docs, model, conn, args.batch)
+    index, id_map = build_index(docs, model, conn, args.batch, progress=_progress)
     save_artifacts(index, id_map, args.faiss, args.idmap)
     conn.close()
     print("Done.")
