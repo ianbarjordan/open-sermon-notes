@@ -30,7 +30,7 @@ from app.config import (  # noqa: E402
     SETTINGS_PATH,
     TOP_K,
 )
-from app.handlers import reload_retriever  # noqa: E402
+from app.handlers import reload_retriever, run_embed, run_ingest  # noqa: E402
 from app.logging_config import get_logger, log_dir, setup_logging  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -709,9 +709,9 @@ def process_new_files(folder: str) -> tuple[str, str]:
     folder = folder.strip()
     raw = f"=== Processing new files from: {folder} ===\n\n"
     raw += "--- Step 1: Ingest files ---\n"
-    raw += _run_subprocess([sys.executable, "build/ingest_files.py", "--source", folder, "--verbose"])
+    raw += run_ingest(source=folder, verbose=True)
     raw += "\n\n--- Step 2: Incremental embed ---\n"
-    raw += _run_subprocess([sys.executable, "build/chunk_embed.py", "--incremental"])
+    raw += run_embed(incremental=True)
 
     raw += "\n\n--- Reloading retriever ---\n"
     new_retriever, msg = reload_retriever(folder.strip())
@@ -733,12 +733,9 @@ def full_rebuild(folder: str) -> tuple[str, str]:
     folder = folder.strip()
     raw = f"=== Full rebuild from: {folder} ===\n\n"
     raw += "--- Step 1: Ingest files (force) ---\n"
-    raw += _run_subprocess([
-        sys.executable, "build/ingest_files.py",
-        "--source", folder, "--force", "--verbose",
-    ])
+    raw += run_ingest(source=folder, force=True, verbose=True)
     raw += "\n\n--- Step 2: Full embed rebuild ---\n"
-    raw += _run_subprocess([sys.executable, "build/chunk_embed.py", "--force"])
+    raw += run_embed(force=True)
 
     raw += "\n\n--- Reloading retriever ---\n"
     new_retriever, msg = reload_retriever(folder)
@@ -941,16 +938,12 @@ def force_ingest_file(reason: str, filename: str) -> str:
             lines.append("Unblocked successfully.")
 
     # Re-ingest just this one file using the library as source
-    raw = _run_subprocess([
-        sys.executable, "build/ingest_files.py",
-        "--source", library, "--force", "--verbose",
-        "--limit", "0",   # no limit — but only new/forced files are touched
-    ])
+    raw = run_ingest(source=library, force=True, verbose=True, limit=0)
     lines.append("\n--- Ingest output ---")
     lines.append(raw.strip())
 
     # Incremental embed
-    raw2 = _run_subprocess([sys.executable, "build/chunk_embed.py", "--incremental"])
+    raw2 = run_embed(incremental=True)
     lines.append("\n--- Embed output ---")
     lines.append(raw2.strip())
 
@@ -1054,13 +1047,10 @@ def batch_force_ingest_quarantine(reason: str) -> str:
         ])
         lines.append("Files unblocked.")
 
-    raw = _run_subprocess([
-        sys.executable, "build/ingest_files.py",
-        "--source", library, "--force", "--verbose",
-    ])
+    raw = run_ingest(source=library, force=True, verbose=True)
     lines.append("\n--- Ingest ---\n" + raw.strip())
 
-    raw2 = _run_subprocess([sys.executable, "build/chunk_embed.py", "--incremental"])
+    raw2 = run_embed(incremental=True)
     lines.append("\n--- Embed ---\n" + raw2.strip())
 
     new_retriever, msg = reload_retriever(library)
