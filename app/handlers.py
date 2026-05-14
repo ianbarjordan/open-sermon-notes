@@ -23,6 +23,7 @@ from typing import Optional
 
 from app.config import DB_PATH, FAISS_PATH, ID_MAP_PATH
 from app.logging_config import get_logger
+from app.paths import resolve_writable
 
 _log = get_logger(__name__)
 
@@ -37,7 +38,9 @@ def reload_retriever(sermon_root: str) -> tuple[Optional[object], str]:
     try:
         from app.retriever import load_retriever as _load_retriever
         retriever = _load_retriever(
-            db_path=DB_PATH, faiss_path=FAISS_PATH, idmap_path=ID_MAP_PATH,
+            db_path=str(resolve_writable(DB_PATH)),
+            faiss_path=str(resolve_writable(FAISS_PATH)),
+            idmap_path=str(resolve_writable(ID_MAP_PATH)),
             sermon_root=sermon_root,
         )
         return retriever, "Retriever reloaded successfully."
@@ -116,19 +119,20 @@ def run_ingest(
 
     Replaces `subprocess.run([sys.executable, "build/ingest_files.py", ...])`.
     Works in a PyInstaller bundle because no external python interpreter is
-    required.
+    required. All output paths resolve via data_root() so writes land in
+    %LOCALAPPDATA%/SermonNotes/ under frozen and in the repo in dev.
     """
     from build import ingest_files as _ingest
 
     args = argparse.Namespace(
         source=source,
-        out='data/documents',
-        quarantine='raw/quarantine',
+        out=str(resolve_writable('data/documents')),
+        quarantine=str(resolve_writable('raw/quarantine')),
         limit=limit,
         dry_run=dry_run,
         force=force,
         verbose=verbose,
-        registry=_ingest.PROCESSED_REGISTRY,
+        registry=str(resolve_writable(_ingest.PROCESSED_REGISTRY)),
         no_progress=True,  # captured stdout — no carriage-returned progress bar
     )
     return _capture_run(lambda: _ingest.run(args), "build.ingest_files.run")
@@ -145,10 +149,10 @@ def run_embed(
     from app.config import DOCUMENTS_DIR, EMBED_MODEL
 
     args = argparse.Namespace(
-        docs=DOCUMENTS_DIR,
-        db=DB_PATH,
-        faiss=FAISS_PATH,
-        idmap=ID_MAP_PATH,
+        docs=str(resolve_writable(DOCUMENTS_DIR)),
+        db=str(resolve_writable(DB_PATH)),
+        faiss=str(resolve_writable(FAISS_PATH)),
+        idmap=str(resolve_writable(ID_MAP_PATH)),
         model=EMBED_MODEL,
         batch=64,
         force=force,

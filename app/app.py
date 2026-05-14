@@ -32,6 +32,7 @@ from app.config import (  # noqa: E402
 )
 from app.handlers import reload_retriever, run_embed, run_ingest  # noqa: E402
 from app.logging_config import get_logger, log_dir, setup_logging  # noqa: E402
+from app.paths import data_root, project_root  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Global retriever + LLM (loaded once at startup)
@@ -39,8 +40,12 @@ from app.logging_config import get_logger, log_dir, setup_logging  # noqa: E402
 _retriever = None
 _llm = None
 
-# Project root (parent of app/)
-_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+# Path roots — see app/paths.py for the frozen-vs-dev branch.
+# _PROJECT_ROOT is the read-only bundled-assets root (subprocess cwd, etc.).
+# _DATA_ROOT is the writable user-data root (settings, quarantine, logs).
+# In dev mode they're identical; under PyInstaller they diverge.
+_PROJECT_ROOT = str(project_root())
+_DATA_ROOT = str(data_root())
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +53,8 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 # ---------------------------------------------------------------------------
 
 def _settings_path() -> Path:
-    return Path(_PROJECT_ROOT) / SETTINGS_PATH
+    # settings.json is writable user-state → data_root() not project_root()
+    return Path(_DATA_ROOT) / SETTINGS_PATH
 
 
 def load_settings() -> dict:
@@ -93,25 +99,38 @@ def _load_components(
 
     try:
         from app.retriever import load_retriever
+        from app.paths import resolve_writable
         _settings = load_settings()
         _sermon_root = _settings.get('sermon_library_folder', '')
-        _retriever = load_retriever(db_path=db, faiss_path=faiss, idmap_path=idmap,
-                                    sermon_root=_sermon_root)
+        # Resolve under data_root() so paths land in %LOCALAPPDATA%/SermonNotes/
+        # under PyInstaller; absolute --db/--faiss/--idmap overrides pass
+        # through unchanged because Path() / abs_path returns abs_path.
+        _retriever = load_retriever(
+            db_path=str(resolve_writable(db)),
+            faiss_path=str(resolve_writable(faiss)),
+            idmap_path=str(resolve_writable(idmap)),
+            sermon_root=_sermon_root,
+        )
         ret_status = "Retriever: loaded"
     except Exception as e:
         ret_status = f"Retriever ERROR: {e}"
         _log.error("Retriever failed to load", exc_info=True)
 
+    # Model file lives under data_root() so setup.bat can download it
+    # without needing write access to Program Files (frozen install dir).
+    # Computed outside the try so it's available in the FileNotFoundError
+    # handler's message.
+    _model_path = str(resolve_writable(model))
     try:
         from app.llm import load_llm
-        _llm = load_llm(model_path=model)
+        _llm = load_llm(model_path=_model_path)
         llm_status = "LLM: loaded"
     except FileNotFoundError as e:
         # The summarising model is a ~2.4 GB download that setup.bat handles.
         # If it's missing the pastor needs a concrete recovery step, not a
         # bare FileNotFoundError.
         llm_status = (
-            f"LLM model file not found at: {model}\n"
+            f"LLM model file not found at: {_model_path}\n"
             "  Re-run setup.bat to download the model (~2.4 GB, one-time).\n"
             "  Search will still work without it — only the AI summary is "
             "unavailable until the file is present."
@@ -457,7 +476,8 @@ def _parse_ingest_counts(raw_log: str) -> dict[str, int]:
 
 def _quarantine_filenames(quarantine_root: str, reason: str, limit: int = 10) -> list[str]:
     """Return up to `limit` filenames from a quarantine sub-folder."""
-    qdir = Path(_PROJECT_ROOT) / quarantine_root / reason
+    # quarantine/ is writable user-state → data_root()
+    qdir = Path(_DATA_ROOT) / quarantine_root / reason
     if not qdir.exists():
         return []
     names = sorted(p.name for p in qdir.iterdir() if p.is_file())
@@ -855,7 +875,8 @@ def execute_batch_action_with_progress(pending: dict):
 # ---------------------------------------------------------------------------
 
 def _quarantine_root() -> Path:
-    return Path(_PROJECT_ROOT) / QUARANTINE_ROOT
+    # Quarantined files belong to the user → writable data_root().
+    return Path(_DATA_ROOT) / QUARANTINE_ROOT
 
 
 def list_quarantine() -> dict[str, list[str]]:

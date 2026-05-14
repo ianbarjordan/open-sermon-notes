@@ -3,13 +3,19 @@ logging_config.py — Offline file logging for the sermon search app.
 
 Writes to logs/app.log (rotating, 5 MB × 3 files).
 No network handlers — strictly local.
+
+The log directory resolves via `app.paths.data_root()` so a frozen
+PyInstaller bundle writes to %LOCALAPPDATA%/SermonNotes/logs/ rather than
+the install dir (which may be read-only under Program Files).
 """
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-_LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+from app.paths import data_root
+
+_LOG_DIR = data_root() / "logs"
 _LOG_FILE = _LOG_DIR / "app.log"
 _MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 _BACKUP_COUNT = 3
