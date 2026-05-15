@@ -1633,6 +1633,16 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    # Field-diagnostic startup banner so a packaged install's first log
+    # entry tells the pastor (or whoever debugs an issue) exactly where
+    # things resolve. Logged at INFO so it lands in logs/app.log.
+    _startup_log = get_logger(__name__)
+    from app.paths import is_frozen
+    _startup_log.info(
+        "Startup — frozen=%s, project_root=%s, data_root=%s",
+        is_frozen(), _PROJECT_ROOT, _DATA_ROOT,
+    )
+
     print("Loading retriever and LLM...")
     ret_status, llm_status = _load_components(
         db=args.db,

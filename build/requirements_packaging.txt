@@ -1,0 +1,7 @@
+# Build-time-only dependencies for producing a PyInstaller release.
+#
+# Not installed by setup.bat — only by make_release.bat (release builder).
+# Keep separate from app/build runtime requirements so the shipped wheel
+# doesn't carry PyInstaller's machinery.
+
+pyinstaller==6.16.0
