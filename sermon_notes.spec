@@ -102,11 +102,10 @@ a = Analysis(
         # IPython / Jupyter and friends are pulled in transitively by some
         # data-science deps but are 30+ MB of dead weight in our context.
         'IPython', 'jupyter', 'notebook', 'ipykernel',
-        # PyTorch's CUDA submodules (we ship CPU-only). PyInstaller's
-        # collector tends to grab them anyway; this excludes them by name.
-        # The matching .dll filtering happens just below for the binaries
-        # that the `excludes=` list above doesn't reach.
-        'torch.cuda', 'torch.distributed',
+        # NOTE: do NOT exclude torch.cuda or torch.distributed — even on the
+        # CPU torch wheel they are imported unconditionally by torch.__init__
+        # and torch.utils.data.dataloader (as stubs). Excluding them breaks
+        # the torch import chain → sentence_transformers fails to load.
         # We do not ship the test suite.
         'pytest', '_pytest', 'pytest_asyncio',
     ],
@@ -183,16 +182,44 @@ def _is_cuda_binary(name: str) -> bool:
 _before = len(a.binaries)
 _stripped = [n for (n, p, t) in a.binaries if _is_cuda_binary(n)]
 import os as _os
-_STRIP_DISABLED = _os.environ.get('SERMON_NO_CUDA_STRIP') == '1'
-if _STRIP_DISABLED:
-    print(f"[spec] CUDA binary strip: DISABLED via SERMON_NO_CUDA_STRIP=1 "
-          f"(would have stripped {len(_stripped)} of {_before})")
+
+# Auto-detect torch flavor. The CPU wheel produces a clean bundle that
+# needs NO stripping — and stripping `shm.dll` (which is in the patterns
+# for the CUDA wheel because it hard-links torch_cuda.dll) would break
+# CPU torch's import chain. SERMON_NO_CUDA_STRIP=1 forces the strip off
+# for diagnostic builds; SERMON_FORCE_CUDA_STRIP=1 forces it on if you
+# really need to ship a stripped CUDA-built bundle.
+def _detect_cuda_torch() -> bool:
+    try:
+        import torch
+    except Exception:
+        return False
+    # CUDA wheels embed 'cu<NNN>' in the version string (e.g. '2.11.0+cu128').
+    # CPU wheels have either no '+' suffix or '+cpu'.
+    return '+cu' in torch.__version__ or 'cu1' in torch.__version__
+
+if _os.environ.get('SERMON_NO_CUDA_STRIP') == '1':
+    _do_strip = False
+    _strip_reason = "DISABLED via SERMON_NO_CUDA_STRIP=1"
+elif _os.environ.get('SERMON_FORCE_CUDA_STRIP') == '1':
+    _do_strip = True
+    _strip_reason = "FORCED via SERMON_FORCE_CUDA_STRIP=1"
+elif _detect_cuda_torch():
+    _do_strip = True
+    _strip_reason = "CUDA torch detected — stripping CUDA DLLs"
 else:
+    _do_strip = False
+    _strip_reason = "CPU torch detected — strip not needed"
+
+if _do_strip:
     a.binaries = [(n, p, t) for (n, p, t) in a.binaries if not _is_cuda_binary(n)]
     a.datas    = [(n, p, t) for (n, p, t) in a.datas    if not _is_cuda_binary(n)]
-    print(f"[spec] CUDA binary strip: {_before} -> {len(a.binaries)} entries")
+    print(f"[spec] CUDA binary strip: {_strip_reason} ({_before} -> {len(a.binaries)} entries)")
     for _n in sorted(_stripped):
         print(f"[spec]   stripped: {_n}")
+else:
+    print(f"[spec] CUDA binary strip: {_strip_reason} "
+          f"(would have stripped {len(_stripped)} of {_before})")
 
 pyz = PYZ(a.pure)
 

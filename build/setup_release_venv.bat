@@ -54,11 +54,19 @@ if errorlevel 1 (
     echo.
     pause & exit /b 1
 )
-call .venv-build\Scripts\activate.bat
+
+:: Use the venv's python.exe directly instead of `activate.bat`.
+:: When this script runs under `cmd /c "build\setup_release_venv.bat"`, the
+:: `call activate.bat` mutation does NOT always persist to subsequent
+:: commands in the nested cmd context — pip ends up running against the
+:: system Python and the venv stays empty. Direct python -m pip avoids the
+:: ambiguity entirely.
+set "VENV_PY=.venv-build\Scripts\python.exe"
+%VENV_PY% -m ensurepip --upgrade >nul 2>&1
 
 echo.
 echo Installing CPU-only PyTorch (this is the key difference from .venv)...
-pip install torch --index-url https://download.pytorch.org/whl/cpu
+%VENV_PY% -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 if errorlevel 1 (
     echo.
     echo ERROR: torch CPU install failed. Check your internet connection.
@@ -68,15 +76,27 @@ if errorlevel 1 (
 
 echo.
 echo Installing build dependencies...
-pip install -r build\requirements_build.txt
+%VENV_PY% -m pip install -r build\requirements_build.txt
 
 echo.
 echo Installing app dependencies...
-pip install -r app\requirements_app.txt
+%VENV_PY% -m pip install -r app\requirements_app.txt
 
 echo.
 echo Installing packaging-only dependencies ^(pyinstaller^)...
-pip install -r build\requirements_packaging.txt
+%VENV_PY% -m pip install -r build\requirements_packaging.txt
+
+echo.
+echo Verifying torch flavor...
+%VENV_PY% -c "import torch; v=torch.__version__; assert '+cu' not in v and 'cu1' not in v, 'Expected CPU torch but got '+v; print('OK: torch '+v)"
+if errorlevel 1 (
+    echo.
+    echo ERROR: The installed torch is the CUDA wheel, not the CPU wheel.
+    echo Delete .venv-build and re-run this script; pip may have grabbed a
+    echo cached wheel from a previous CUDA install.
+    echo.
+    pause & exit /b 1
+)
 
 echo.
 echo === Release venv ready ===
