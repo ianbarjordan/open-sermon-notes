@@ -124,9 +124,38 @@ Commits in order:
 
 ---
 
-## Tier 6 — Packaging & distribution
+## Tier 6 — Packaging & distribution  ✅ COMPLETE (2026-05-16)
 
-### 17. PyInstaller / portable launcher
+### 17. PyInstaller / portable launcher  ✅
+
+9-commit pass: 17a renamed build scripts (drop numeric prefix) → 17b/17c
+extracted `build_parser`/`run(args)`/`main(argv)` from each → 17d added
+`handlers.run_ingest` / `run_embed` with stdout+stderr+logging capture →
+17e replaced six `sys.executable` subprocess sites with in-process calls
+(B-1 resolved) → 17f added `app/paths.py` with `is_frozen`/`project_root`/
+`data_root`/`resolve_writable`, wired through app + logging + handlers
+(B-2 resolved) → 17g landed `sermon_notes.spec`, `pyi_rth_libs.py`
+runtime hook, `build/requirements_packaging.txt`, `build/make_release.bat`
+→ 17h iterated on the spec (CUDA strip, safehttpx/groovy, backports) and
+created `build/setup_release_venv.bat` for a CPU-torch-only release venv
+→ 17i auto-detects torch flavor in the spec and switched
+`setup_release_venv.bat` to direct `python.exe -m pip`.
+
+Shipping artifacts (verified end-to-end on the dev machine):
+- `dist/SermonNotes/SermonNotes.exe` ≈ 886 MB; boots, loads Gradio,
+  serves HTTP 200 on 127.0.0.1
+- `build/setup_release_venv.bat` — one-time CPU-torch release venv setup
+- `build/make_release.bat` — repeatable release builder; refuses to ship
+  if the test suite is red or the build venv has CUDA torch
+- `sermon_notes.spec` — auto-detects CPU vs CUDA torch and applies the
+  strip only when needed; pefile-verified DLL patterns
+- `pyi_rth_libs.py` — runtime hook fixing numpy 2.x DLL search path
+
+230 tests passing at completion.
+
+---
+
+### 17 — Historical scope notes (preserved for reference)
 
 **Three architectural changes absorbed from the pre-delivery review (B-1, B-2)
 that are scope-of-Item-17 — they cannot be patched, they are the packaging work.**

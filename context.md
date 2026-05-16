@@ -47,10 +47,11 @@ app/app.py   ← Gradio UI: query → hybrid retrieval (FAISS+FTS5+RRF) → Phi-
 | Module | Responsibility |
 |--------|---------------|
 | `config.py` | All constants and paths — single source of truth |
-| `logging_config.py` | Rotating file logger (5 MB × 3); `logs/app.log` |
+| `paths.py` | `is_frozen` / `project_root` / `data_root` / `resolve_writable` — PyInstaller-aware path resolution. Writable user data → `%LOCALAPPDATA%/SermonNotes/` when frozen; repo root in dev. |
+| `logging_config.py` | Rotating file logger (5 MB × 3); writes via `data_root() / "logs/app.log"` |
 | `retriever.py` | `load_retriever(sermon_root=)` factory; hybrid dense+sparse+RRF search |
 | `llm.py` | `load_llm()` factory; `detect_n_gpu_layers()` auto-GPU; `LLM.generate()` |
-| `handlers.py` | Minimal shared helpers — currently just `reload_retriever()`; absorbs more during Item 18 split |
+| `handlers.py` | Shared helpers: `reload_retriever()` plus `run_ingest()` / `run_embed()` — the in-process bridge that replaced subprocess calls to the build scripts for PyInstaller compatibility. Captures stdout/stderr/logging into a string so the technical-log accordion still works. |
 | `app.py` | Gradio Blocks UI; 3 tabs: Search, Quarantine, Manage Archive |
 
 ---
@@ -298,9 +299,34 @@ launch.bat
 
 ---
 
+## Packaging (Item 17 — shipping bundle)
+
+PyInstaller `--onedir` build producing `dist/SermonNotes/` (~886 MB).
+
+| Artifact | Role |
+|----------|------|
+| `sermon_notes.spec` | Entry point + collect_all() for heavy deps + CUDA-strip with auto-detection |
+| `pyi_rth_libs.py` | Runtime hook — registers `*.libs` sibling dirs on Windows so numpy 2.x's `_multiarray_umath.pyd` finds its openblas dep |
+| `build/setup_release_venv.bat` | One-time: creates `.venv-build` with **CPU-only torch** + all runtime + packaging deps |
+| `build/make_release.bat` | Repeatable: pre-flight checks (CPU torch, green tests) → clean build → smoke test |
+| `build/requirements_packaging.txt` | Build-time deps (pyinstaller 6.16.0, backports.tarfile) |
+
+Frozen-mode runtime layout:
+- Code + bundled deps → `Path(sys.executable).parent` (PyInstaller --onedir dir)
+- Writable user data → `%LOCALAPPDATA%/SermonNotes/{data,logs,raw,models}/`
+- LLM model file (~2.4 GB Phi-3.5-mini GGUF) downloaded by `setup.bat`
+  into the writable models dir; not bundled in the .exe
+
+Subprocess calls to the build scripts were retired in Item 17 B-1 —
+the bundle uses the in-process bridge in `handlers.py` instead, so the
+.exe is self-contained and doesn't shell out to a python interpreter
+that wouldn't exist anyway in a frozen install.
+
+---
+
 ## Test Suite
 
-213 tests across 7 test files. Run with:
+230 tests across 9 test files. Run with:
 ```bat
 .venv\Scripts\python.exe -m pytest tests\ -v
 ```
@@ -308,7 +334,8 @@ launch.bat
 | File | Coverage |
 |------|---------|
 | `test_app_handlers.py` | handle_query, expand_results, open_file, on_row_select, library-configured guard, quarantine handlers (incl. per-file ignore confirm), settings, archive handlers, generator progress wrappers, Full Rebuild confirm flow, quote-path validation, unblock failure classifier |
-| `test_handlers.py` | reload_retriever success/failure paths |
+| `test_handlers.py` | reload_retriever success/failure; run_ingest/run_embed + _capture_run (stdout/stderr/logging capture for the in-process build bridge) |
+| `test_paths.py` | is_frozen / project_root / data_root / resolve_writable — covers dev mode, frozen+%LOCALAPPDATA%, and frozen-without-LOCALAPPDATA fallback |
 | `test_config.py` | config constants, thresholds |
 | `test_incremental_embed.py` | init_db, build_index_incremental, load_documents_from_db, sha256 stale detection |
 | `test_ingest_registry.py` | hash registry load/save |
