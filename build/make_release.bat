@@ -6,31 +6,61 @@ setlocal
 ::
 :: Output: dist\SermonNotes\ (the --onedir bundle; ship the whole folder).
 ::
-:: Run this from the project root, in a fresh cmd window. Run setup.bat
-:: first if .venv is missing.
+:: PREREQUISITE: build\setup_release_venv.bat must have been run once to
+:: create .venv-build (a CPU-torch-only venv specifically for shipping).
+:: See that script's header for why the dev .venv isn't used directly.
 :: ---------------------------------------------------------------------------
 
-if not exist ".venv\Scripts\activate.bat" (
+if not exist ".venv-build\Scripts\activate.bat" (
     echo.
-    echo ERROR: Virtual environment ^(.venv^) is missing.
-    echo Run setup.bat first to install runtime dependencies.
+    echo ERROR: Release venv ^(.venv-build^) is missing.
+    echo.
+    echo The shipping bundle uses CPU-only torch, which lives in a separate
+    echo venv so the dev .venv ^(which may have CUDA torch installed^) doesn't
+    echo accidentally bloat the bundle by ~3.7 GB.
+    echo.
+    echo Fix: run build\setup_release_venv.bat ^(one-time setup^), then re-run
+    echo this script.
     echo.
     pause
     exit /b 1
 )
 
-call .venv\Scripts\activate.bat
+call .venv-build\Scripts\activate.bat
 
-echo Installing packaging dependencies...
-pip install -q -r build\requirements_packaging.txt
+echo Verifying packaging dependencies are present...
+python -c "import PyInstaller, pefile, backports.tarfile" >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo ERROR: Could not install pyinstaller. Check your internet connection
-    echo or the version pin in build\requirements_packaging.txt.
+    echo Packaging deps incomplete in .venv-build — re-installing...
+    pip install -q -r build\requirements_packaging.txt
+    if errorlevel 1 (
+        echo.
+        echo ERROR: Could not install pyinstaller. Check your internet
+        echo connection or the version pin in build\requirements_packaging.txt.
+        echo.
+        pause
+        exit /b 1
+    )
+)
+
+echo.
+echo Sanity-check: confirming this venv has CPU torch ^(not CUDA^)...
+for /f "tokens=*" %%v in ('python -c "import torch; print(torch.__version__)"') do set TORCH_VER=%%v
+echo Torch version: %TORCH_VER%
+echo %TORCH_VER% | findstr /i "cu1" >nul
+if not errorlevel 1 (
+    echo.
+    echo WARNING: .venv-build appears to have CUDA torch installed ^(%TORCH_VER%^).
+    echo The resulting bundle will be 4 GB+ and may fail to load CUDA DLLs on
+    echo target machines without a GPU.
+    echo.
+    echo To fix: delete .venv-build and re-run build\setup_release_venv.bat.
     echo.
     pause
     exit /b 1
 )
+echo OK — CPU torch detected.
 
 echo.
 echo Running the test suite as a build pre-flight...
@@ -50,7 +80,6 @@ if exist build\SermonNotes rmdir /s /q build\SermonNotes
 
 echo.
 echo Running PyInstaller. This takes several minutes.
-echo (Bundle size will be ~500 MB without the LLM model; ~3 GB with it.)
 pyinstaller --noconfirm --clean sermon_notes.spec
 if errorlevel 1 (
     echo.

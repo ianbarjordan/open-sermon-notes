@@ -5,3 +5,7 @@
 # doesn't carry PyInstaller's machinery.
 
 pyinstaller==6.16.0
+# setuptools >= 60 vendors jaraco.context, which imports backports.tarfile.
+# PyInstaller's pyi_rth_pkgres runtime hook crashes if backports.tarfile
+# isn't installed alongside setuptools. Belt-and-braces: pin it explicitly.
+backports.tarfile==1.2.0
