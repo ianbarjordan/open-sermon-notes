@@ -1176,6 +1176,36 @@ CSS = """
 .gradio-container {
     font-family: Georgia, 'Times New Roman', serif;
     background-color: #f9f7f4;
+
+    /* Primary brand color — deep maroon (#500000). Overrides Gradio's
+       default orange on primary buttons, slider tracks, focus rings, and
+       selection highlights so the whole UI feels pastoral rather than
+       SaaS-orange. */
+    --primary-50:  #fdf2f2;
+    --primary-100: #fbe5e5;
+    --primary-200: #f1b3b3;
+    --primary-300: #d97777;
+    --primary-400: #a83333;
+    --primary-500: #500000;   /* base */
+    --primary-600: #6a0000;   /* hover */
+    --primary-700: #400000;
+    --primary-800: #300000;
+    --primary-900: #200000;
+
+    --button-primary-background-fill: #500000;
+    --button-primary-background-fill-hover: #6a0000;
+    --button-primary-border-color: #500000;
+    --button-primary-border-color-hover: #6a0000;
+    --button-primary-text-color: #ffffff;
+
+    --color-accent: #500000;
+    --color-accent-soft: #fbe5e5;
+    --slider-color: #500000;
+    --checkbox-background-color-selected: #500000;
+    --checkbox-border-color-selected: #500000;
+    --link-text-color: #500000;
+    --link-text-color-hover: #6a0000;
+    --link-text-color-visited: #500000;
 }
 
 /* ── App header ──────────────────────────────────────────────────────── */
