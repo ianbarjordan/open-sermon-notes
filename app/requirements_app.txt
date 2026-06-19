@@ -1,8 +1,12 @@
-# Install torch (GPU/CUDA build) FIRST before this file:
-#   uv pip install torch
+# Install torch (CPU or GPU/CUDA build) FIRST before this file. Examples:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu   # Windows CPU
+#   uv pip install torch                                                  # Linux/CUDA
+#
+# All versions pinned exactly — required for reproducible PyInstaller builds.
+# Bumping a version is a deliberate action: re-test the full suite, then update.
 
-gradio>=5.0
+gradio==6.12.0
 llama-cpp-python==0.3.16
-faiss-cpu>=1.8
-sentence-transformers>=3.0,<4
-numpy>=1.26
+faiss-cpu==1.13.2
+sentence-transformers==3.4.1
+numpy==2.4.4

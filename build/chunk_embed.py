@@ -1,12 +1,12 @@
 """
-02_chunk_embed.py — Read JSON docs → chunk → embed with BGE-small →
+chunk_embed.py — Read JSON docs → chunk → embed with BGE-small →
 write FAISS IndexFlatL2 + SQLite FTS5 + id_map.json.
 
 Usage:
-    python build/02_chunk_embed.py --dry-run
-    python build/02_chunk_embed.py
-    python build/02_chunk_embed.py --force
-    python build/02_chunk_embed.py --incremental
+    python build/chunk_embed.py --dry-run
+    python build/chunk_embed.py
+    python build/chunk_embed.py --force
+    python build/chunk_embed.py --incremental
 """
 import argparse
 import json
@@ -42,6 +42,34 @@ def load_documents(docs_dir: str) -> list[dict]:
     return docs
 
 
+def load_documents_from_db(db_path: str) -> list[dict]:
+    """Load all documents from the SQLite documents table.
+
+    Used when data/documents/ JSON files are absent — e.g. when running
+    from a pre-built search bundle that ships without the intermediate JSON
+    staging files.  Returns the same dict shape as load_documents().
+    """
+    if not Path(db_path).exists():
+        return []
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT doc_id, sha256, source_file, title, scripture_ref,
+                   date, format, word_count, text
+            FROM documents
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # documents table doesn't exist yet (fresh DB)
+        return []
+    finally:
+        conn.close()
+    cols = ['doc_id', 'sha256', 'source_file', 'title',
+            'scripture_ref', 'date', 'format', 'word_count', 'text']
+    return [dict(zip(cols, row)) for row in rows]
+
+
 # ---------------------------------------------------------------------------
 # SQLite setup
 # ---------------------------------------------------------------------------
@@ -49,12 +77,14 @@ def load_documents(docs_dir: str) -> list[dict]:
 _CREATE_DOCUMENTS = """
 CREATE TABLE IF NOT EXISTS documents (
     doc_id        TEXT PRIMARY KEY,
+    sha256        TEXT NOT NULL,
     source_file   TEXT NOT NULL,
     title         TEXT,
     scripture_ref TEXT,
     date          TEXT,
     format        TEXT,
     word_count    INTEGER,
+    text          TEXT,
     ingested_at   TEXT DEFAULT (datetime('now'))
 );
 """
@@ -95,17 +125,19 @@ def insert_document_metadata(conn: sqlite3.Connection, doc: dict) -> None:
     conn.execute(
         """
         INSERT OR REPLACE INTO documents
-            (doc_id, source_file, title, scripture_ref, date, format, word_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (doc_id, sha256, source_file, title, scripture_ref, date, format, word_count, text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             doc['doc_id'],
+            doc.get('sha256', 'legacy_no_hash'),
             doc['source_file'],
             doc.get('title'),
             doc.get('scripture_ref'),
             doc.get('date'),
             doc.get('format'),
             doc.get('word_count'),
+            doc.get('text', ''),
         ),
     )
 
@@ -152,8 +184,12 @@ def embed_chunks(texts: list[str], model, batch_size: int = 64):
 # Core build
 # ---------------------------------------------------------------------------
 
-def build_index(docs: list[dict], model, conn: sqlite3.Connection, batch_size: int):
-    """Chunk, embed, insert into FTS5, return (faiss_index, id_map)."""
+def build_index(docs: list[dict], model, conn: sqlite3.Connection, batch_size: int,
+                progress: bool = True):
+    """Chunk, embed, insert into FTS5, return (faiss_index, id_map).
+
+    progress=False suppresses tqdm — used when stdout is captured in-process.
+    """
     import faiss
     import numpy as np
 
@@ -183,11 +219,13 @@ def build_index(docs: list[dict], model, conn: sqlite3.Connection, batch_size: i
 
     # Embed
     print(f"Embedding with {EMBED_MODEL} (batch={batch_size})...")
-    try:
-        from tqdm import tqdm
-        bar = tqdm(total=len(all_texts), unit='chunk')
-    except ImportError:
-        bar = None
+    bar = None
+    if progress:
+        try:
+            from tqdm import tqdm
+            bar = tqdm(total=len(all_texts), unit='chunk')
+        except ImportError:
+            pass
 
     import numpy as np
     all_vecs_list = []
@@ -230,28 +268,55 @@ def build_index(docs: list[dict], model, conn: sqlite3.Connection, batch_size: i
     return index, id_map
 
 
+def _remove_stale_chunks(conn: sqlite3.Connection, doc_id: str, index, id_map: dict):
+    """
+    Remove chunks belonging to doc_id from FAISS (not easily possible with IndexFlatL2
+    without rebuild) and SQLite.
+
+    Since FAISS IndexFlatL2 doesn't support easy deletion by ID, 'incremental'
+    updates that modify existing documents will currently result in ORPHANED VECTORS
+    in FAISS unless we rebuild the index.
+
+    For v2 beta, if a hash mismatch occurs, we'll delete from SQLite and warn
+    the user that a Full Rebuild is recommended for optimal vector search.
+    """
+    conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+    # Also remove from id_map (marks slots as stale)
+    for pos, cid in list(id_map.items()):
+        if cid.startswith(f"{doc_id}::"):
+            del id_map[pos]
+
+
 def build_index_incremental(
     new_docs: list[dict],
+    stale_doc_ids: list[str],
     model,
     conn: sqlite3.Connection,
     existing_index,
     existing_id_map: dict,
     batch_size: int,
+    progress: bool = True,
 ) -> tuple:
     """Append-only update: embed new_docs and add to existing FAISS + FTS5.
 
-    Returns (updated_index, updated_id_map).
+    If stale_doc_ids is provided, these are removed from SQLite before adding.
+    progress=False suppresses tqdm (used when stdout is captured in-process).
     """
     import numpy as np
 
-    offset = existing_index.ntotal
     id_map = dict(existing_id_map)
 
+    if stale_doc_ids:
+        print(f"Removing {len(stale_doc_ids)} stale documents from SQLite...")
+        for did in stale_doc_ids:
+            _remove_stale_chunks(conn, did, existing_index, id_map)
+
+    offset = existing_index.ntotal
     all_texts: list[str] = []
     all_chunk_ids: list[str] = []
     chunk_docs: list[dict] = []
 
-    print(f"Chunking {len(new_docs)} new documents...")
+    print(f"Chunking {len(new_docs)} new/updated documents...")
     for doc in new_docs:
         text = doc.get('text', '')
         if not text:
@@ -266,15 +331,17 @@ def build_index_incremental(
     print(f"New chunks: {len(all_texts)}")
 
     if not all_texts:
-        print("No new chunks to embed. Index is already up to date.")
+        print("No new chunks to embed.")
         return existing_index, id_map
 
     print(f"Embedding with {EMBED_MODEL} (batch={batch_size})...")
-    try:
-        from tqdm import tqdm
-        bar = tqdm(total=len(all_texts), unit='chunk')
-    except ImportError:
-        bar = None
+    bar = None
+    if progress:
+        try:
+            from tqdm import tqdm
+            bar = tqdm(total=len(all_texts), unit='chunk')
+        except ImportError:
+            pass
 
     all_vecs_list = []
     for i in range(0, len(all_texts), batch_size):
@@ -296,32 +363,17 @@ def build_index_incremental(
     for i, chunk_id in enumerate(all_chunk_ids):
         id_map[offset + i] = chunk_id
 
-    # Insert into SQLite (INSERT OR IGNORE for documents, plain insert for chunks)
+    # Insert into SQLite
     print("Writing new chunks to SQLite FTS5...")
     seen_docs: set = set()
     for chunk_id, chunk_text, doc in zip(all_chunk_ids, all_texts, chunk_docs):
         if doc['doc_id'] not in seen_docs:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO documents
-                    (doc_id, source_file, title, scripture_ref, date, format, word_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    doc['doc_id'],
-                    doc['source_file'],
-                    doc.get('title'),
-                    doc.get('scripture_ref'),
-                    doc.get('date'),
-                    doc.get('format'),
-                    doc.get('word_count'),
-                ),
-            )
+            insert_document_metadata(conn, doc)
             seen_docs.add(doc['doc_id'])
         insert_chunk_fts(conn, chunk_id, doc, chunk_text)
 
     conn.commit()
-    print(f"SQLite: +{len(seen_docs)} new documents, +{len(all_texts)} new chunks")
+    print(f"SQLite: +{len(seen_docs)} docs (new/updated), +{len(all_texts)} new chunks")
 
     return existing_index, id_map
 
@@ -344,7 +396,7 @@ def save_artifacts(index, id_map: dict, faiss_path: str, idmap_path: str) -> Non
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='Chunk + embed documents and build FAISS + FTS5 index.'
     )
@@ -366,10 +418,24 @@ def main() -> None:
                         help='Chunk/count only, no writes')
     parser.add_argument('--incremental', action='store_true',
                         help='Append only new documents to existing index')
-    args = parser.parse_args()
+    parser.add_argument('--no-progress', action='store_true',
+                        help='Suppress tqdm progress bars (in-process callers '
+                             'should set this so a captured stdout buffer does '
+                             'not fill with carriage-returned progress lines)')
+    return parser
 
+
+def run(args: argparse.Namespace) -> int:
+    """Execute the chunk+embed pipeline. Caller passes a parsed Namespace.
+
+    Returns 0 on success. All output goes to stdout — in-process callers
+    should redirect sys.stdout before invoking.
+    """
     docs = load_documents(args.docs)
-    print(f"Loaded {len(docs)} documents from {args.docs!r}")
+    if not docs:
+        print(f"No JSON docs found in {args.docs!r} — falling back to documents table in {args.db!r}")
+        docs = load_documents_from_db(args.db)
+    print(f"Loaded {len(docs)} documents")
 
     if args.dry_run:
         print("DRY RUN — counting chunks only, no index written")
@@ -380,7 +446,7 @@ def main() -> None:
                 chunks = chunk_document(text, COMMENTARY_CHUNK_WORDS, MIN_CHUNK_WORDS)
                 total_chunks += len(chunks)
         print(f"Total chunks would be: {total_chunks}")
-        return
+        return 0
 
     # Load embedding model
     print(f"Loading embedding model: {args.model}")
@@ -393,10 +459,11 @@ def main() -> None:
         faiss_file = Path(args.faiss)
         idmap_file = Path(args.idmap)
 
+        _progress = not getattr(args, 'no_progress', False)
         if not faiss_file.exists() or not idmap_file.exists():
             print("No existing index found — falling back to full build.")
             conn = init_db(args.db, force=False)
-            index, id_map = build_index(docs, model, conn, args.batch)
+            index, id_map = build_index(docs, model, conn, args.batch, progress=_progress)
         else:
             # Load existing artifacts
             existing_index = faiss.read_index(str(faiss_file))
@@ -406,35 +473,64 @@ def main() -> None:
 
             conn = init_db(args.db, force=False)
 
-            # Find doc_ids already in DB
-            existing_ids = {
-                row[0]
-                for row in conn.execute("SELECT doc_id FROM documents").fetchall()
+            # Find doc_ids + hashes already in DB
+            db_registry = {
+                row[0]: row[1]
+                for row in conn.execute("SELECT doc_id, sha256 FROM documents").fetchall()
             }
-            new_docs = [d for d in docs if d['doc_id'] not in existing_ids]
-            print(f"Already indexed: {len(existing_ids)} docs. New docs: {len(new_docs)}")
+            
+            new_docs = []
+            stale_doc_ids = []
+            
+            for d in docs:
+                did = d['doc_id']
+                if did not in db_registry:
+                    new_docs.append(d)
+                elif d.get('sha256', '') != db_registry[did]:
+                    new_docs.append(d)
+                    stale_doc_ids.append(did)
+            
+            print(f"Already indexed: {len(db_registry)} docs.")
+            print(f"New/Updated docs: {len(new_docs)} ({len(stale_doc_ids)} modified)")
+
+            if stale_doc_ids:
+                print(
+                    f"NOTE: {len(stale_doc_ids)} modified doc(s) detected. "
+                    "Their SQLite chunks will be replaced, but orphaned FAISS vectors "
+                    "remain until a Full Rebuild is run. Search accuracy is unaffected "
+                    "for new queries; run Full Rebuild to fully remove stale vectors."
+                )
 
             if not new_docs:
                 print("Index is already up to date. Nothing to add.")
                 conn.close()
-                return
+                return 0
 
             index, id_map = build_index_incremental(
-                new_docs, model, conn, existing_index, existing_id_map, args.batch
+                new_docs, stale_doc_ids, model, conn, existing_index, existing_id_map,
+                args.batch, progress=_progress,
             )
 
         save_artifacts(index, id_map, args.faiss, args.idmap)
         conn.close()
         print("Done (incremental).")
-        return
+        return 0
 
     # Full build (default)
+    _progress = not getattr(args, 'no_progress', False)
     conn = init_db(args.db, force=args.force)
-    index, id_map = build_index(docs, model, conn, args.batch)
+    index, id_map = build_index(docs, model, conn, args.batch, progress=_progress)
     save_artifacts(index, id_map, args.faiss, args.idmap)
     conn.close()
     print("Done.")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. argv=None reads from sys.argv as usual."""
+    args = build_parser().parse_args(argv)
+    return run(args)
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

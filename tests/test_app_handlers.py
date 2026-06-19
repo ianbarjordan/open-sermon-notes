@@ -7,9 +7,27 @@ import unittest.mock as mock
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import app.app as app_module
+
+# Capture the real _library_is_configured BEFORE the autouse fixture
+# replaces it, so tests that exercise the guard can restore it.
+_REAL_LIBRARY_IS_CONFIGURED = app_module._library_is_configured
+
+
+# ---------------------------------------------------------------------------
+# Library-configured fixture: most tests assume the sermon folder is set up;
+# the B-4 guard would otherwise short-circuit handle_query before reaching
+# the retriever mock. Tests that exercise the guard itself restore the real
+# implementation via _REAL_LIBRARY_IS_CONFIGURED.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _library_configured(monkeypatch):
+    monkeypatch.setattr(app_module, '_library_is_configured', lambda: True)
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +69,55 @@ def test_handle_query_whitespace_only():
 def test_handle_query_no_retriever():
     app_module._retriever = None
     answer, rows, status, state = app_module.handle_query("grace", 5)
-    assert "not available" in answer.lower() or "retriever" in answer.lower()
+    # Sanitized message points to log folder + setup recovery path
+    assert "search index" in answer.lower() or "log folder" in answer.lower()
+    assert "setup.bat" in answer.lower() or "app.log" in answer.lower()
+
+
+# ---------------------------------------------------------------------------
+# B-4: library-not-configured guard
+# ---------------------------------------------------------------------------
+
+def test_handle_query_no_library_configured(monkeypatch):
+    """If no sermon folder is set, return a friendly setup-guidance message
+    instead of running a search that would yield unopenable file rows."""
+    monkeypatch.setattr(app_module, '_library_is_configured', lambda: False)
+    mock_retriever = mock.MagicMock()
+    app_module._retriever = mock_retriever
+    answer, rows, status, state = app_module.handle_query("grace", 5)
+    assert "manage archive" in answer.lower()
+    assert "sermon" in answer.lower()
+    assert rows == []
+    assert state == []
+    # The retriever must NOT be called when no library is configured
+    mock_retriever.search.assert_not_called()
+
+
+def test_library_is_configured_empty_settings(tmp_path, monkeypatch):
+    """No folder in settings → False."""
+    monkeypatch.setattr(app_module, '_library_is_configured', _REAL_LIBRARY_IS_CONFIGURED)
+    monkeypatch.setattr(app_module, 'load_settings', lambda: {})
+    assert app_module._library_is_configured() is False
+
+
+def test_library_is_configured_folder_missing(tmp_path, monkeypatch):
+    """Folder set in settings but does not exist on disk → False."""
+    monkeypatch.setattr(app_module, '_library_is_configured', _REAL_LIBRARY_IS_CONFIGURED)
+    monkeypatch.setattr(
+        app_module, 'load_settings',
+        lambda: {'sermon_library_folder': str(tmp_path / 'nonexistent')},
+    )
+    assert app_module._library_is_configured() is False
+
+
+def test_library_is_configured_valid_folder(tmp_path, monkeypatch):
+    """Folder set + exists on disk → True."""
+    monkeypatch.setattr(app_module, '_library_is_configured', _REAL_LIBRARY_IS_CONFIGURED)
+    monkeypatch.setattr(
+        app_module, 'load_settings',
+        lambda: {'sermon_library_folder': str(tmp_path)},
+    )
+    assert app_module._library_is_configured() is True
 
 
 def test_handle_query_returns_rows():
@@ -66,19 +132,74 @@ def test_handle_query_returns_rows():
 
     assert len(rows) == 3
     assert state == chunks
-    mock_retriever.search.assert_called_once_with("grace", top_k=5)
+    # Retriever is always called with MAX_TOP_K so auto-expansion has the full pool
+    from app.config import MAX_TOP_K
+    mock_retriever.search.assert_called_once_with("grace", top_k=MAX_TOP_K)
 
 
-def test_handle_query_passes_top_k():
-    chunks = _make_chunks(10)
+def test_handle_query_always_fetches_max_top_k():
+    """Slider value does not limit the retriever call — only the minimum shown."""
+    from app.config import MAX_TOP_K
+    chunks = _make_chunks(5)
     mock_retriever = mock.MagicMock()
     mock_retriever.search.return_value = chunks
-
     app_module._retriever = mock_retriever
     app_module._llm = None
 
-    _, _, _, _ = app_module.handle_query("forgiveness", 10)
-    mock_retriever.search.assert_called_once_with("forgiveness", top_k=10)
+    app_module.handle_query("forgiveness", top_k=3)
+    mock_retriever.search.assert_called_once_with("forgiveness", top_k=MAX_TOP_K)
+
+
+def test_handle_query_slider_sets_minimum():
+    """Slider value is the floor: results below AUTO_EXPAND_THRESHOLD beyond
+    the slider value are not included."""
+    from app.config import AUTO_EXPAND_THRESHOLD
+    # 5 chunks: first 2 above threshold, next 3 below
+    high = AUTO_EXPAND_THRESHOLD + 0.005
+    low  = AUTO_EXPAND_THRESHOLD - 0.005
+    chunks = (
+        _make_chunks(2, score=high) +
+        _make_chunks(3, score=low)
+    )
+    mock_retriever = mock.MagicMock()
+    mock_retriever.search.return_value = chunks
+    app_module._retriever = mock_retriever
+    app_module._llm = None
+
+    # Slider = 1 → base is 1, but 1 more is high-confidence → 2 rows shown
+    # State holds the full fetched pool (5), not just the visible slice
+    _, rows, _, state = app_module.handle_query("grace", top_k=1)
+    assert len(rows) == 2
+    assert len(state) == 5  # full pool stored in state
+
+
+def test_slice_chunks_caps_visible_at_MAX_VISIBLE_ROWS():
+    """Auto-expansion must not push the visible list above MAX_VISIBLE_ROWS."""
+    from app.config import AUTO_EXPAND_THRESHOLD, MAX_VISIBLE_ROWS
+    high = AUTO_EXPAND_THRESHOLD + 0.005
+    # 50 high-confidence chunks — every single one qualifies for expansion
+    chunks = _make_chunks(50, score=high)
+    visible, _status = app_module._slice_chunks(chunks, top_k=1)
+    assert len(visible) == MAX_VISIBLE_ROWS, (
+        f"_slice_chunks returned {len(visible)} rows — must cap at "
+        f"MAX_VISIBLE_ROWS={MAX_VISIBLE_ROWS} so the pastor never sees a wall of text"
+    )
+
+
+def test_handle_query_auto_expand_status():
+    """Status line mentions auto-expansion when extra high-confidence results are added."""
+    from app.config import AUTO_EXPAND_THRESHOLD
+    high = AUTO_EXPAND_THRESHOLD + 0.005
+    chunks = _make_chunks(5, score=high)
+    mock_retriever = mock.MagicMock()
+    mock_retriever.search.return_value = chunks
+    app_module._retriever = mock_retriever
+    app_module._llm = None
+
+    # Slider = 2, but all 5 chunks are above AUTO_EXPAND_THRESHOLD
+    _, _, status, state = app_module.handle_query("grace", top_k=2)
+    assert len(state) == 5
+    assert 'additional' in status.lower() or '5' in status
 
 
 def test_handle_query_row_structure():
@@ -137,7 +258,84 @@ def test_handle_query_retriever_exception():
     app_module._retriever = mock_retriever
 
     answer, rows, status, state = app_module.handle_query("grace", 5)
-    assert 'error' in answer.lower() or 'error' in status.lower()
+    # Sanitized: no internal noun ("FAISS") leaks to the UI; pastor gets a
+    # log-folder pointer instead.
+    assert 'FAISS' not in answer
+    assert 'something went wrong' in answer.lower() or 'log folder' in answer.lower()
+    assert 'failed' in status.lower() or 'logs' in status.lower()
+
+
+# ---------------------------------------------------------------------------
+# _extract_row_index
+# ---------------------------------------------------------------------------
+
+def test_extract_row_index_select_data_list():
+    """Standard Gradio 5 SelectData: evt.index = [row, col]."""
+    evt = mock.MagicMock()
+    evt.index = [3, 1]
+    assert app_module._extract_row_index(evt) == 3
+
+
+def test_extract_row_index_select_data_int():
+    """Some Gradio builds: evt.index is a plain int."""
+    evt = mock.MagicMock()
+    evt.index = 7
+    assert app_module._extract_row_index(evt) == 7
+
+
+def test_extract_row_index_plain_list():
+    """When Gradio passes a plain list (row, col) — no .index attribute that matters."""
+    assert app_module._extract_row_index([2, 0]) == 2
+
+
+def test_extract_row_index_callable_index_is_ignored():
+    """A plain Python list has .index() as a callable method — must not crash."""
+    # Python list: evt.index is the list.index() *method*, not a row number
+    evt = [5, 0]  # plain list — evt.index is callable
+    # Should fall through to the isinstance(evt, list) branch → 5
+    assert app_module._extract_row_index(evt) == 5
+
+
+def test_extract_row_index_none_event():
+    """None returns None without error."""
+    assert app_module._extract_row_index(None) is None
+
+
+# ---------------------------------------------------------------------------
+# expand_results
+# ---------------------------------------------------------------------------
+
+def test_expand_results_empty_state():
+    rows, status = app_module.expand_results(5, [])
+    assert rows == []
+    assert status == ""
+
+
+def test_expand_results_shows_base():
+    from app.config import AUTO_EXPAND_THRESHOLD
+    chunks = _make_chunks(10, score=AUTO_EXPAND_THRESHOLD - 0.005)  # all below threshold
+    rows, status = app_module.expand_results(4, chunks)
+    assert len(rows) == 4  # exactly slider value, no auto-expansion
+
+
+def test_expand_results_auto_expands():
+    from app.config import AUTO_EXPAND_THRESHOLD
+    high = AUTO_EXPAND_THRESHOLD + 0.005
+    chunks = _make_chunks(5, score=high)
+    rows, status = app_module.expand_results(2, chunks)
+    # All 5 are above threshold → all shown
+    assert len(rows) == 5
+    assert 'additional' in status.lower() or '5' in status
+
+
+def test_expand_results_slider_increase_shows_more():
+    from app.config import AUTO_EXPAND_THRESHOLD
+    low = AUTO_EXPAND_THRESHOLD - 0.005
+    chunks = _make_chunks(10, score=low)
+    rows_3, _ = app_module.expand_results(3, chunks)
+    rows_8, _ = app_module.expand_results(8, chunks)
+    assert len(rows_3) == 3
+    assert len(rows_8) == 8
 
 
 # ---------------------------------------------------------------------------
@@ -145,9 +343,9 @@ def test_handle_query_retriever_exception():
 # ---------------------------------------------------------------------------
 
 def _make_select_event(row: int, col: int = 0):
-    """Create a mock gr.SelectData-like event."""
+    """Create a mock gr.SelectData-like event (index is a non-callable attribute)."""
     evt = mock.MagicMock()
-    evt.index = [row, col]
+    evt.index = [row, col]  # MagicMock attribute — not callable
     return evt
 
 
@@ -176,27 +374,47 @@ def test_on_row_select_missing_source():
     assert 'not available' in result.lower() or 'no' in result.lower()
 
 
-def test_on_row_select_file_not_on_disk():
-    chunks = [{'source_file': '/nonexistent/path/Sermon.docx', 'title': 'Test'}]
+def test_on_row_select_file_not_on_disk(tmp_path):
+    # Use a path that is guaranteed not to exist (rather than a Unix absolute path,
+    # which resolves differently on Windows)
+    missing = tmp_path / "does_not_exist" / "Sermon.docx"
+    chunks = [{'source_file': str(missing), 'title': 'Test'}]
     evt = _make_select_event(0)
     result = app_module.on_row_select(evt, chunks)
-    assert 'not found' in result.lower() or 'could not' in result.lower()
+    # Sanitized: 'Couldn't open the file — it may have been moved or renamed.'
+    assert "couldn't" in result.lower() or 'moved' in result.lower()
+    # Still names the expected path so the pastor can find it on disk
+    assert str(missing) in result or 'Sermon.docx' in result
 
 
-def test_on_row_select_opens_file(tmp_path):
-    # Create a real temporary file so path.exists() passes
+def test_on_row_select_opens_file_linux(tmp_path):
+    """Non-Windows path: uses subprocess.run(['xdg-open', ...])."""
     tmp_file = tmp_path / "Sermon Test.docx"
     tmp_file.write_text("test content")
-
     chunks = [{'source_file': str(tmp_file), 'title': 'Test'}]
     evt = _make_select_event(0)
 
-    # Patch the platform-specific open call
     with mock.patch('subprocess.run') as mock_run, \
          mock.patch('sys.platform', 'linux'):
         mock_run.return_value = mock.MagicMock(returncode=0)
         result = app_module.on_row_select(evt, chunks)
 
+    assert 'Opened' in result
+    assert 'Sermon Test.docx' in result
+
+
+def test_on_row_select_opens_file_windows(tmp_path):
+    """Windows path: uses os.startfile, NOT subprocess."""
+    tmp_file = tmp_path / "Sermon Test.docx"
+    tmp_file.write_text("test content")
+    chunks = [{'source_file': str(tmp_file), 'title': 'Test'}]
+    evt = _make_select_event(0)
+
+    with mock.patch('os.startfile') as mock_startfile, \
+         mock.patch('sys.platform', 'win32'):
+        result = app_module.on_row_select(evt, chunks)
+
+    mock_startfile.assert_called_once()
     assert 'Opened' in result
     assert 'Sermon Test.docx' in result
 
@@ -227,10 +445,650 @@ def test_run_subprocess_nonzero_exit():
 # ---------------------------------------------------------------------------
 
 def test_process_new_files_empty_folder():
-    result = app_module.process_new_files("")
-    assert 'enter' in result.lower() or 'please' in result.lower()
+    summary, _ = app_module.process_new_files("")
+    assert 'enter' in summary.lower() or 'please' in summary.lower()
 
 
 def test_full_rebuild_empty_folder():
-    result = app_module.full_rebuild("")
-    assert 'enter' in result.lower() or 'please' in result.lower()
+    summary, _ = app_module.full_rebuild("")
+    assert 'enter' in summary.lower() or 'please' in summary.lower()
+
+
+def test_process_new_files_invalid_path(tmp_path):
+    """Non-existent directory returns a user-friendly error, not an exception."""
+    bad_path = str(tmp_path / "does_not_exist")
+    summary, raw = app_module.process_new_files(bad_path)
+    assert 'not found' in summary.lower() or 'check' in summary.lower()
+    assert raw == ""
+
+
+def test_full_rebuild_invalid_path(tmp_path):
+    bad_path = str(tmp_path / "does_not_exist")
+    summary, raw = app_module.full_rebuild(bad_path)
+    assert 'not found' in summary.lower() or 'check' in summary.lower()
+    assert raw == ""
+
+
+# ---------------------------------------------------------------------------
+# open_file (number-input fallback handler)
+# ---------------------------------------------------------------------------
+
+def test_open_file_no_results():
+    result = app_module.open_file(1, [])
+    assert 'no search' in result.lower() or 'run a search' in result.lower()
+
+
+def test_open_file_out_of_range():
+    chunks = _make_chunks(2)
+    result = app_module.open_file(5, chunks)
+    assert 'does not exist' in result.lower() or 'result' in result.lower()
+
+
+def test_open_file_missing_source():
+    chunks = [{'source_file': '', 'title': 'Test'}]
+    result = app_module.open_file(1, chunks)
+    assert 'no source' in result.lower() or 'source file' in result.lower()
+
+
+def test_open_file_file_not_on_disk(tmp_path):
+    missing = tmp_path / "nope" / "Sermon.docx"
+    chunks = [{'source_file': str(missing), 'title': 'Test'}]
+    result = app_module.open_file(1, chunks)
+    # Sanitized: "Couldn't open the file — it may have been moved or renamed."
+    assert "couldn't" in result.lower() or 'moved' in result.lower()
+    # Still surfaces the expected path so the pastor can locate the file.
+    assert str(missing) in result or 'Sermon.docx' in result
+
+
+def test_open_file_opens_on_linux(tmp_path):
+    tmp_file = tmp_path / "Grace.docx"
+    tmp_file.write_text("content")
+    chunks = [{'source_file': str(tmp_file), 'title': 'Test'}]
+
+    with mock.patch('subprocess.run') as mock_run, \
+         mock.patch('sys.platform', 'linux'):
+        mock_run.return_value = mock.MagicMock(returncode=0)
+        result = app_module.open_file(1, chunks)
+
+    assert 'Opened' in result
+    assert 'Grace.docx' in result
+
+
+def test_open_file_opens_on_windows(tmp_path):
+    """Windows path: must call os.startfile, not subprocess."""
+    tmp_file = tmp_path / "Grace.docx"
+    tmp_file.write_text("content")
+    chunks = [{'source_file': str(tmp_file), 'title': 'Test'}]
+
+    with mock.patch('os.startfile') as mock_startfile, \
+         mock.patch('sys.platform', 'win32'):
+        result = app_module.open_file(1, chunks)
+
+    mock_startfile.assert_called_once()
+    assert 'Opened' in result
+
+
+# ---------------------------------------------------------------------------
+# load_settings / save_settings
+# ---------------------------------------------------------------------------
+
+def test_settings_roundtrip(tmp_path, monkeypatch):
+    """save_settings then load_settings returns the same dict."""
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(app_module, '_settings_path', lambda: settings_file)
+
+    app_module.save_settings({'sermon_library_folder': r'C:\Sermons'})
+    loaded = app_module.load_settings()
+    assert loaded['sermon_library_folder'] == r'C:\Sermons'
+
+
+def test_load_settings_missing_file(tmp_path, monkeypatch):
+    """Missing settings file returns empty dict, not an error."""
+    monkeypatch.setattr(app_module, '_settings_path',
+                        lambda: tmp_path / "nonexistent.json")
+    assert app_module.load_settings() == {}
+
+
+def test_save_settings_creates_parent(tmp_path, monkeypatch):
+    deep = tmp_path / "a" / "b" / "settings.json"
+    monkeypatch.setattr(app_module, '_settings_path', lambda: deep)
+    app_module.save_settings({'key': 'value'})
+    assert deep.exists()
+
+
+# ---------------------------------------------------------------------------
+# _parse_ingest_counts
+# ---------------------------------------------------------------------------
+
+_SAMPLE_INGEST_LOG = """
+Found 253 files in 'SampleData'
+Platform: Windows
+
+--- Ingest Summary ---
+  accepted                  153
+  skipped                    21
+  too_short                  19
+  non_faith                  18
+  filename_flagged           15
+  format_pub                 13
+  manual_review              10
+  worship_slides              3
+  duplicates                  1
+  TOTAL                     253
+"""
+
+
+def test_parse_ingest_counts_accepted():
+    counts = app_module._parse_ingest_counts(_SAMPLE_INGEST_LOG)
+    assert counts['accepted'] == 153
+
+
+def test_parse_ingest_counts_manual_review():
+    counts = app_module._parse_ingest_counts(_SAMPLE_INGEST_LOG)
+    assert counts['manual_review'] == 10
+
+
+def test_parse_ingest_counts_total_ignored():
+    """TOTAL line should not appear as a count key."""
+    counts = app_module._parse_ingest_counts(_SAMPLE_INGEST_LOG)
+    assert 'TOTAL' not in counts
+
+
+def test_parse_ingest_counts_empty_log():
+    assert app_module._parse_ingest_counts("no summary here") == {}
+
+
+# ---------------------------------------------------------------------------
+# _build_run_summary
+# ---------------------------------------------------------------------------
+
+def test_build_run_summary_success():
+    summary = app_module._build_run_summary(_SAMPLE_INGEST_LOG)
+    assert '153' in summary
+    assert '✅' in summary
+
+
+def test_build_run_summary_word_blocked():
+    log = _SAMPLE_INGEST_LOG + "\nWord blocked by administrator\n[exit code: 1]"
+    summary = app_module._build_run_summary(log)
+    assert '⚠️' in summary
+    assert 'word' in summary.lower() or 'unblock' in summary.lower()
+
+
+def test_build_run_summary_generic_exit_code():
+    summary = app_module._build_run_summary("some output\n[exit code: 1]")
+    assert '⚠️' in summary
+
+
+def test_build_run_summary_no_counts_no_error():
+    """No summary block, no error → generic completion message."""
+    summary = app_module._build_run_summary("", operation='Rebuild')
+    assert 'Rebuild' in summary or '✅' in summary
+
+
+# ---------------------------------------------------------------------------
+# unblock_library
+# ---------------------------------------------------------------------------
+
+def test_unblock_library_empty_folder():
+    summary, _ = app_module.unblock_library("")
+    assert 'enter' in summary.lower() or 'please' in summary.lower()
+
+
+def test_unblock_library_invalid_path(tmp_path):
+    bad = str(tmp_path / "missing")
+    summary, _ = app_module.unblock_library(bad)
+    assert 'not found' in summary.lower()
+
+
+def test_unblock_library_non_windows(tmp_path):
+    with mock.patch('sys.platform', 'linux'):
+        summary, _ = app_module.unblock_library(str(tmp_path))
+    assert 'windows' in summary.lower()
+
+
+def test_unblock_library_windows_success(tmp_path):
+    with mock.patch('sys.platform', 'win32'), \
+         mock.patch('subprocess.run') as mock_run:
+        mock_run.return_value = mock.MagicMock(
+            returncode=0, stdout="Done.\n", stderr=""
+        )
+        summary, raw = app_module.unblock_library(str(tmp_path))
+
+    assert '✅' in summary
+    assert 'process new files' in summary.lower() or 'retry' in summary.lower()
+
+
+def test_unblock_library_windows_failure(tmp_path):
+    with mock.patch('sys.platform', 'win32'), \
+         mock.patch('subprocess.run') as mock_run:
+        mock_run.return_value = mock.MagicMock(
+            returncode=1, stdout="", stderr="Access denied"
+        )
+        summary, raw = app_module.unblock_library(str(tmp_path))
+
+    assert '⚠️' in summary
+    assert 'access denied' in raw.lower()
+    # S-9: 'access denied' should trigger the Administrator-permission summary
+    assert 'administrator' in summary.lower()
+
+
+# ---------------------------------------------------------------------------
+# S-9: unblock failure-summary classifier
+# ---------------------------------------------------------------------------
+
+def test_unblock_failure_summary_access_denied_says_administrator():
+    msg = app_module._unblock_failure_summary("Access is denied. blah blah")
+    assert 'administrator' in msg.lower()
+    assert 'run as administrator' in msg.lower() or 'launch.bat' in msg.lower()
+
+
+def test_unblock_failure_summary_folder_missing_says_check_drive():
+    msg = app_module._unblock_failure_summary("Cannot find path 'D:\\foo'")
+    assert 'moved' in msg.lower() or 'drive' in msg.lower() or 'unplugged' in msg.lower()
+
+
+def test_unblock_failure_summary_unknown_points_to_log_folder():
+    msg = app_module._unblock_failure_summary("something obscure went wrong")
+    assert 'log folder' in msg.lower() or 'app.log' in msg.lower()
+
+
+# ---------------------------------------------------------------------------
+# browse_folder
+# ---------------------------------------------------------------------------
+
+def test_browse_folder_non_windows():
+    with mock.patch('sys.platform', 'linux'):
+        result = app_module.browse_folder()
+    assert result == ''
+
+
+def test_browse_folder_windows_returns_path(tmp_path):
+    with mock.patch('sys.platform', 'win32'), \
+         mock.patch('subprocess.run') as mock_run:
+        mock_run.return_value = mock.MagicMock(
+            returncode=0, stdout=str(tmp_path)
+        )
+        result = app_module.browse_folder()
+    assert result == str(tmp_path)
+
+
+def test_browse_folder_windows_cancelled():
+    """User cancels dialog → empty string returned."""
+    with mock.patch('sys.platform', 'win32'), \
+         mock.patch('subprocess.run') as mock_run:
+        mock_run.return_value = mock.MagicMock(returncode=0, stdout='')
+        result = app_module.browse_folder()
+    assert result == ''
+
+
+# ---------------------------------------------------------------------------
+# Quarantine handlers
+# ---------------------------------------------------------------------------
+
+def _setup_quarantine(tmp_path, buckets: dict[str, list[str]]) -> Path:
+    """Create a quarantine directory tree under tmp_path."""
+    root = tmp_path / "raw" / "quarantine"
+    for reason, files in buckets.items():
+        bucket = root / reason
+        bucket.mkdir(parents=True)
+        for fname in files:
+            (bucket / fname).write_text("dummy content")
+    return root
+
+
+def test_list_quarantine_returns_buckets(tmp_path):
+    root = _setup_quarantine(tmp_path, {
+        'manual_review': ['a.doc', 'b.doc'],
+        'duplicates': ['c.docx'],
+    })
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.list_quarantine()
+    assert set(result.keys()) == {'manual_review', 'duplicates'}
+    assert set(result['manual_review']) == {'a.doc', 'b.doc'}
+
+
+def test_list_quarantine_sorted_by_count(tmp_path):
+    root = _setup_quarantine(tmp_path, {
+        'too_short': ['x.docx'],
+        'duplicates': ['a.docx', 'b.docx', 'c.docx'],
+        'non_faith': ['d.docx', 'e.docx'],
+    })
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.list_quarantine()
+    counts = [len(v) for v in result.values()]
+    assert counts == sorted(counts, reverse=True)
+
+
+def test_list_quarantine_empty_root(tmp_path):
+    missing = tmp_path / "raw" / "quarantine"
+    with mock.patch.object(app_module, '_quarantine_root', return_value=missing):
+        result = app_module.list_quarantine()
+    assert result == {}
+
+
+def test_list_quarantine_skips_empty_buckets(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    (root / "empty_bucket").mkdir(parents=True)
+    (root / "non_faith").mkdir(parents=True)
+    (root / "non_faith" / "sermon.docx").write_text("content")
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.list_quarantine()
+    assert 'empty_bucket' not in result
+    assert 'non_faith' in result
+
+
+def test_ignore_quarantine_file_removes_file(tmp_path):
+    root = _setup_quarantine(tmp_path, {'duplicates': ['dup.docx']})
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.ignore_quarantine_file('duplicates', 'dup.docx')
+    assert not (root / 'duplicates' / 'dup.docx').exists()
+    assert 'ignored' in result.lower() or 'removed' in result.lower()
+
+
+def test_ignore_quarantine_file_already_gone(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    root.mkdir(parents=True)
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.ignore_quarantine_file('duplicates', 'ghost.docx')
+    assert 'already' in result.lower() or 'removed' in result.lower()
+
+
+def test_get_quarantine_summary_no_files(tmp_path):
+    missing = tmp_path / "raw" / "quarantine"
+    with mock.patch.object(app_module, '_quarantine_root', return_value=missing):
+        result = app_module.get_quarantine_summary()
+    assert 'no files' in result.lower() or 'everything' in result.lower()
+
+
+def test_get_quarantine_summary_with_files(tmp_path):
+    root = _setup_quarantine(tmp_path, {
+        'manual_review': ['a.doc', 'b.doc'],
+        'duplicates': ['c.docx'],
+    })
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.get_quarantine_summary()
+    assert '3' in result   # total
+    assert '2' in result   # manual_review count
+
+
+def test_force_ingest_file_no_library(tmp_path):
+    root = _setup_quarantine(tmp_path, {'manual_review': ['sermon.doc']})
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root), \
+         mock.patch.object(app_module, 'load_settings', return_value={'sermon_library_folder': ''}):
+        result = app_module.force_ingest_file('manual_review', 'sermon.doc')
+    assert 'not set' in result.lower() or 'library' in result.lower()
+
+
+def test_force_ingest_file_missing_from_quarantine(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    root.mkdir(parents=True)
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root), \
+         mock.patch.object(app_module, 'load_settings',
+                           return_value={'sermon_library_folder': str(tmp_path)}):
+        result = app_module.force_ingest_file('manual_review', 'ghost.doc')
+    assert 'not found' in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# batch_ignore_quarantine
+# ---------------------------------------------------------------------------
+
+def test_batch_ignore_removes_all_files(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    bucket = root / "too_short"
+    bucket.mkdir(parents=True)
+    for i in range(3):
+        (bucket / f"sermon_{i}.docx").write_text("x")
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.batch_ignore_quarantine('too_short')
+    assert "3" in result
+    assert list(bucket.iterdir()) == []
+
+
+def test_batch_ignore_missing_bucket(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    root.mkdir(parents=True)
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.batch_ignore_quarantine('nonexistent')
+    assert 'not found' in result.lower()
+
+
+def test_batch_ignore_empty_bucket(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    bucket = root / "too_short"
+    bucket.mkdir(parents=True)
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        result = app_module.batch_ignore_quarantine('too_short')
+    assert 'empty' in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# request_batch_action / execute_batch_action / cancel_batch_action
+# ---------------------------------------------------------------------------
+
+_CLEARED = {'action': None, 'reason': None, 'count': 0, 'filename': None}
+
+
+def test_request_batch_action_ignore_returns_pending_state():
+    pending, msg, col_update = app_module.request_batch_action('ignore', 'too_short', 5)
+    assert pending == {'action': 'ignore', 'reason': 'too_short', 'count': 5, 'filename': None}
+    assert '5' in msg
+    assert col_update.get('visible') is True  # gr.update dict
+
+
+def test_request_batch_action_force_returns_pending_state():
+    pending, msg, col_update = app_module.request_batch_action('force', 'manual_review', 10)
+    assert pending == {'action': 'force', 'reason': 'manual_review', 'count': 10, 'filename': None}
+    assert '10' in msg
+    assert col_update.get('visible') is True
+
+
+def test_request_batch_action_large_count_adds_warning():
+    pending, msg, _col = app_module.request_batch_action('force', 'too_short', 200)
+    assert 'minutes' in msg.lower() or '200' in msg
+
+
+def test_execute_batch_action_clears_pending_and_hides_panel(tmp_path):
+    root = tmp_path / "raw" / "quarantine"
+    bucket = root / "too_short"
+    bucket.mkdir(parents=True)
+    (bucket / "a.docx").write_text("x")
+    pending = {'action': 'ignore', 'reason': 'too_short', 'count': 1, 'filename': None}
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        cleared, confirm_msg, col_update, result = app_module.execute_batch_action(pending)
+    assert cleared == _CLEARED
+    assert confirm_msg == ""
+    assert col_update.get('visible') is False
+    assert '1' in result or 'deleted' in result.lower() or '✓' in result
+
+
+def test_execute_batch_action_with_empty_pending():
+    cleared, confirm_msg, col_update, result = app_module.execute_batch_action(_CLEARED)
+    assert cleared == _CLEARED
+    assert col_update.get('visible') is False
+
+
+def test_cancel_batch_action_clears_state():
+    cleared, confirm_msg, col_update, result = app_module.cancel_batch_action()
+    assert cleared == _CLEARED
+    assert confirm_msg == ""
+    assert col_update.get('visible') is False
+    assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# B-6: single-file Ignore confirmation
+# ---------------------------------------------------------------------------
+
+def test_request_single_ignore_returns_pending_with_filename():
+    pending, msg, col_update = app_module.request_single_ignore(
+        'manual_review', 'sermon_2019.doc',
+    )
+    assert pending == {
+        'action': 'ignore_one',
+        'reason': 'manual_review',
+        'count': 1,
+        'filename': 'sermon_2019.doc',
+    }
+    assert 'sermon_2019.doc' in msg
+    assert 'cannot be undone' in msg.lower()
+    assert col_update.get('visible') is True
+
+
+def test_execute_batch_action_ignore_one_deletes_named_file(tmp_path):
+    """Confirming a per-file Ignore removes only that file from the bucket."""
+    root = tmp_path / "raw" / "quarantine"
+    bucket = root / "too_short"
+    bucket.mkdir(parents=True)
+    (bucket / "doomed.docx").write_text("x")
+    (bucket / "keeper.docx").write_text("x")
+    pending = {
+        'action': 'ignore_one',
+        'reason': 'too_short',
+        'count': 1,
+        'filename': 'doomed.docx',
+    }
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        cleared, _, col_update, result = app_module.execute_batch_action(pending)
+    assert cleared == _CLEARED
+    assert col_update.get('visible') is False
+    assert not (bucket / "doomed.docx").exists()
+    assert (bucket / "keeper.docx").exists()  # other files untouched
+    assert 'doomed.docx' in result.lower() or 'ignored' in result.lower()
+
+
+def test_execute_batch_action_ignore_one_missing_filename_noops():
+    """ignore_one without a filename should not crash."""
+    pending = {'action': 'ignore_one', 'reason': 'too_short', 'count': 1, 'filename': None}
+    cleared, _, col_update, result = app_module.execute_batch_action(pending)
+    assert cleared == _CLEARED
+    assert col_update.get('visible') is False
+    assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# B-7: reject quote characters in folder paths
+# ---------------------------------------------------------------------------
+
+def test_validate_folder_rejects_double_quote(tmp_path):
+    """Folder paths containing " break PowerShell command strings — reject them."""
+    bad_path = str(tmp_path) + '/some"weird/folder'
+    result = app_module._validate_and_persist_folder(bad_path)
+    assert result is not None
+    summary, _log = result
+    assert 'quote' in summary.lower()
+
+
+def test_validate_folder_rejects_single_quote(tmp_path):
+    bad_path = str(tmp_path) + "/some'weird/folder"
+    result = app_module._validate_and_persist_folder(bad_path)
+    assert result is not None
+    summary, _log = result
+    assert 'quote' in summary.lower()
+
+
+def test_validate_folder_accepts_normal_path(tmp_path, monkeypatch):
+    """Normal paths still pass validation and persist to settings."""
+    saved = {}
+    monkeypatch.setattr(app_module, 'load_settings', lambda: {})
+    monkeypatch.setattr(
+        app_module, 'save_settings',
+        lambda s: saved.update(s),
+    )
+    result = app_module._validate_and_persist_folder(str(tmp_path))
+    assert result == (None, None)
+    assert saved.get('sermon_library_folder') == str(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# S-1: progress wrappers — generators that yield "Working..." before the
+# real result so the pastor sees long-running clicks register immediately.
+# ---------------------------------------------------------------------------
+
+def test_process_new_files_with_progress_yields_working_first(monkeypatch):
+    monkeypatch.setattr(app_module, 'process_new_files', lambda f: ("done", "log"))
+    gen = app_module.process_new_files_with_progress("/some/folder")
+    first = next(gen)
+    assert isinstance(first, tuple) and len(first) == 2
+    assert 'working' in first[0].lower() or '⏳' in first[0]
+    second = next(gen)
+    assert second == ("done", "log")
+
+
+def test_full_rebuild_with_progress_yields_working_first(monkeypatch):
+    monkeypatch.setattr(app_module, 'full_rebuild', lambda f: ("rebuilt", "log"))
+    gen = app_module.full_rebuild_with_progress("/some/folder")
+    first = next(gen)
+    assert 'rebuild' in first[0].lower() or '⏳' in first[0]
+    assert next(gen) == ("rebuilt", "log")
+
+
+def test_unblock_library_with_progress_yields_working_first(monkeypatch):
+    monkeypatch.setattr(app_module, 'unblock_library', lambda f: ("unblocked", "log"))
+    gen = app_module.unblock_library_with_progress("/some/folder")
+    first = next(gen)
+    assert 'unblock' in first[0].lower() or '⏳' in first[0]
+    assert next(gen) == ("unblocked", "log")
+
+
+# ---------------------------------------------------------------------------
+# S-8: Full Rebuild confirmation flow
+# ---------------------------------------------------------------------------
+
+def test_request_full_rebuild_confirmation_shows_panel(tmp_path):
+    pending, msg, col_update = app_module.request_full_rebuild_confirmation(str(tmp_path))
+    assert pending == str(tmp_path)
+    assert 'rebuild' in msg.lower()
+    assert 'several minutes' in msg.lower() or 'minutes' in msg.lower()
+    assert col_update.get('visible') is True
+
+
+def test_request_full_rebuild_confirmation_empty_folder_hides_panel():
+    """Empty folder → defer to the actual handler's friendly error; do not show confirm."""
+    pending, msg, col_update = app_module.request_full_rebuild_confirmation("")
+    assert pending == ""
+    assert col_update.get('visible') is False
+
+
+def test_cancel_full_rebuild_returns_5tuple_hidden():
+    """Cancel clears state and hides the panel without running anything."""
+    result = app_module.cancel_full_rebuild()
+    assert len(result) == 5
+    assert result[0] == ""  # pending cleared
+    assert result[2].get('visible') is False  # panel hidden
+    assert result[3] == "" and result[4] == ""  # summary/log untouched
+
+
+def test_confirm_full_rebuild_with_progress_yields_working_then_result(monkeypatch):
+    """Generator wrapper: working state first (panel hidden), then real result."""
+    monkeypatch.setattr(app_module, 'full_rebuild', lambda f: ("Rebuild complete", "log output"))
+    gen = app_module.confirm_full_rebuild_with_progress("/some/folder")
+    first = next(gen)
+    assert len(first) == 5
+    assert first[2].get('visible') is False
+    assert '⏳' in first[3] or 'rebuild' in first[3].lower()
+    second = next(gen)
+    assert second[3] == "Rebuild complete"
+    assert second[4] == "log output"
+
+
+def test_execute_batch_action_with_progress_yields_intermediate_state(tmp_path):
+    """Working state is yielded before the actual file operation completes."""
+    root = tmp_path / "raw" / "quarantine"
+    bucket = root / "too_short"
+    bucket.mkdir(parents=True)
+    (bucket / "a.docx").write_text("x")
+    pending = {'action': 'ignore', 'reason': 'too_short', 'count': 1, 'filename': None}
+    with mock.patch.object(app_module, '_quarantine_root', return_value=root):
+        gen = app_module.execute_batch_action_with_progress(pending)
+        first = next(gen)
+        # Mid-flight: pending kept intact, panel hidden, working message in 4th slot
+        assert first[0] == pending
+        assert first[3].lower().startswith('⏳') or 'working' in first[3].lower()
+        # File still exists at this point
+        assert (bucket / "a.docx").exists()
+        # Run to completion
+        final = next(gen)
+        assert final[0] == _CLEARED
+        assert not (bucket / "a.docx").exists()

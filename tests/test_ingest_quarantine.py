@@ -1,25 +1,18 @@
-"""Tests for 01_ingest_files.py — quarantine pipeline filters."""
-import importlib.util
+"""Tests for build/ingest_files.py — quarantine pipeline filters."""
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Load 01_ingest_files.py via importlib (numeric prefix workaround)
-_spec = importlib.util.spec_from_file_location(
-    "ingest01",
-    str(Path(__file__).resolve().parent.parent / "build" / "01_ingest_files.py"),
+from build.ingest_files import (  # noqa: E402
+    should_skip_silently,
+    is_filename_flagged,
+    count_faith_hits,
+    compute_sha256,
+    make_doc_id,
+    _strip_surrogates,
+    write_document_json,
 )
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
-
-should_skip_silently = _mod.should_skip_silently
-is_filename_flagged  = _mod.is_filename_flagged
-count_faith_hits     = _mod.count_faith_hits
-compute_sha256       = _mod.compute_sha256
-make_doc_id          = _mod.make_doc_id
-_strip_surrogates    = _mod._strip_surrogates
-write_document_json  = _mod.write_document_json
 
 
 # ---------------------------------------------------------------------------
@@ -207,9 +200,7 @@ def test_quarantine_skips_existing_file():
     """quarantine() must not crash when destination already exists."""
     import tempfile
     from build.format_detect import detect_format  # noqa
-
-    # Re-import quarantine from the loaded module
-    quarantine_fn = _mod.quarantine
+    from build.ingest_files import quarantine as quarantine_fn
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Create a source file

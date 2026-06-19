@@ -1,11 +1,11 @@
 """
-01_ingest_files.py — Walk source dir, parse every file, apply quarantine pipeline,
+ingest_files.py — Walk source dir, parse every file, apply quarantine pipeline,
 write JSON to data/documents/.
 
 Usage:
-    python build/01_ingest_files.py --source SampleData/ --dry-run --verbose
-    python build/01_ingest_files.py --source SampleData/ --verbose
-    python build/01_ingest_files.py --source SampleData/ --limit 10
+    python build/ingest_files.py --source SampleData/ --dry-run --verbose
+    python build/ingest_files.py --source SampleData/ --verbose
+    python build/ingest_files.py --source SampleData/ --limit 10
 """
 import argparse
 import hashlib
@@ -140,13 +140,22 @@ def _get_win_word_app():
 
 
 def _close_win_word_app() -> None:
-    """Quit the persistent Word COM instance if active."""
+    """Quit the persistent Word COM instance if active.
+
+    A Word.Quit() failure here is non-fatal — the OS will reap the COM
+    server on process exit — but we surface it on stderr so the cause
+    is visible in the technical log if it ever matters.
+    """
     global _WIN_WORD_APP
     if _WIN_WORD_APP is not None:
         try:
             _WIN_WORD_APP.Quit()
-        except Exception:
-            pass
+        except Exception as e:
+            print(
+                f"[warning] Word COM Quit() failed: {e} "
+                "(non-fatal — OS will reap the COM server)",
+                file=sys.stderr,
+            )
         _WIN_WORD_APP = None
 
 
@@ -414,6 +423,7 @@ def ingest_file(
     out_dir: str,
     quarantine_root: str,
     seen_hashes: set,
+    source_root_path: Path,
     dry_run: bool = False,
     force: bool = False,
     verbose: bool = False,
@@ -503,9 +513,9 @@ def ingest_file(
         quarantine(path, 'non_faith', quarantine_root, dry_run)
         return 'non_faith'
 
-    # Step 9: Duplicate check
+    # Step 9: Duplicate check (skip if --force is used to allow re-processing)
     sha = compute_sha256(path)
-    if sha in seen_hashes:
+    if not force and sha in seen_hashes:
         if verbose:
             print(f"  DUP     {path.name}")
         quarantine(path, 'duplicates', quarantine_root, dry_run)
@@ -518,11 +528,19 @@ def ingest_file(
     meta = parse_filename(stem)
     doc_id = make_doc_id(stem)
 
-    # Store as POSIX path (forward slashes) for cross-platform consistency
-    source_file = path.as_posix()
+    # Store source_file as a RELATIVE path to the source root for portability.
+    # On Windows, this ensures it works regardless of the drive letter/base path.
+    # We resolve the absolute path then compute relative to the provided --source.
+    source_root = Path(source_root_path).resolve()
+    try:
+        source_file = path.resolve().relative_to(source_root).as_posix()
+    except ValueError:
+        # Fallback if path is outside source root (unlikely but possible)
+        source_file = path.as_posix()
 
     doc = {
         'doc_id':        doc_id,
+        'sha256':        sha,
         'source_file':   source_file,
         'title':         meta.get('title'),
         'scripture_ref': meta.get('scripture_ref'),
@@ -550,7 +568,7 @@ def ingest_file(
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='Ingest sermon files through quarantine pipeline.'
     )
@@ -570,8 +588,18 @@ def main() -> None:
                         help='Per-file decisions to stdout')
     parser.add_argument('--registry',   metavar='PATH', default=PROCESSED_REGISTRY,
                         help=f'Persistent hash registry (default: {PROCESSED_REGISTRY})')
-    args = parser.parse_args()
+    parser.add_argument('--no-progress', action='store_true',
+                        help='Suppress the tqdm progress bar (useful for in-process calls '
+                             'where stdout is redirected to a StringIO buffer)')
+    return parser
 
+
+def run(args: argparse.Namespace) -> int:
+    """Execute the ingest pipeline. Caller passes a parsed Namespace.
+
+    Returns 0 on success. All output goes to stdout — callers that need to
+    capture it should redirect sys.stdout before calling.
+    """
     files = collect_files(args.source)
     if args.limit:
         files = files[:args.limit]
@@ -591,19 +619,24 @@ def main() -> None:
 
     counts: dict[str, int] = {}
 
-    try:
-        from tqdm import tqdm
-        iterator = tqdm(files, unit='file')
-    except ImportError:
-        iterator = files  # type: ignore[assignment]
+    # tqdm is disabled in --no-progress mode (in-process calls) so the captured
+    # stdout buffer doesn't fill with carriage-returned progress lines.
+    iterator: object = files
+    if not getattr(args, 'no_progress', False):
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(files, unit='file')
+        except ImportError:
+            pass
 
     try:
-        for path in iterator:
+        for path in iterator:  # type: ignore[assignment]
             outcome = ingest_file(
                 path=path,
                 out_dir=args.out,
                 quarantine_root=args.quarantine,
                 seen_hashes=seen_hashes,
+                source_root_path=Path(args.source),
                 dry_run=args.dry_run,
                 force=args.force,
                 verbose=args.verbose,
@@ -624,7 +657,17 @@ def main() -> None:
     for outcome, n in sorted(counts.items(), key=lambda x: -x[1]):
         print(f"  {outcome:25s} {n:4d}")
     print(f"  {'TOTAL':25s} {total:4d}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. argv=None reads from sys.argv as usual.
+
+    Returns the exit code from run().
+    """
+    args = build_parser().parse_args(argv)
+    return run(args)
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
