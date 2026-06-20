@@ -15,6 +15,7 @@ build/pyinstaller*.txt
 build/smoke*.txt
 build/help*.txt
 build/rebuild*.log
+build/make_release*.log
 dist/
 logs/
 stdout.txt

@@ -1,0 +1,90 @@
+Sermon Notes — Installation
+===========================
+
+What's in the box
+-----------------
+One file: SermonNotes-Setup-1.0.0.exe (about 230 MB).
+That's the complete installer — the app, the AI summary model, everything.
+
+
+To install
+----------
+1. Double-click SermonNotes-Setup-1.0.0.exe.
+
+2. Windows may show a "Windows protected your PC" screen the first time.
+   Click "More info", then "Run anyway". This is normal for software that
+   isn't published through the Microsoft Store.
+
+3. Click "Next" through the wizard. The default install location is fine.
+   You don't need to make any choices — there's a checkbox for a Desktop
+   shortcut and a checkbox for "Launch Sermon Notes now" at the end, both
+   are optional.
+
+4. The install takes a minute or two (it unpacks the AI model). When it
+   finishes, the app will open in your web browser at
+   http://127.0.0.1:7860 — if it doesn't, find "Sermon Notes" in your
+   Start Menu and launch it from there.
+
+
+First-time setup inside the app
+-------------------------------
+The browser window will show three tabs at the top: Search, Quarantine,
+and Manage Archive.
+
+1. Click the "Manage Archive" tab.
+
+2. Click "Browse..." and pick the folder where your sermon files live.
+   You can also paste the path. Examples:
+      C:\Users\YourName\Documents\Sermons
+      D:\Sermons
+
+3. Click "Process New Files". This reads every .doc / .docx / .pptx in
+   that folder, extracts the text, and builds the search index. The
+   first run on a large library can take several minutes — leave the
+   window open until you see a summary appear below the button.
+
+4. Switch back to the "Search" tab and type a question or topic. Press
+   Enter to search. Click any row in the results table to open the
+   original sermon file.
+
+That's it. From here on it's just Search → Read.
+
+
+When you add new sermons
+------------------------
+Drop the new files into the same folder, open Sermon Notes, go to the
+Manage Archive tab, and click "Process New Files" again. Only the new
+files get indexed — existing ones are skipped.
+
+
+To uninstall
+------------
+Open Windows Settings → Apps → Apps & features → search "Sermon Notes" →
+click Uninstall. Your search index, settings, and any quarantined files
+are left on disk so you can reinstall later without losing them.
+
+If you want a truly clean uninstall, after running the uninstaller also
+delete the folder:
+    %LOCALAPPDATA%\SermonNotes
+
+
+Troubleshooting
+---------------
+The app didn't open in a browser:
+   Find "Sermon Notes" in the Start Menu and launch it manually. A small
+   black console window will open first; the browser opens 20-30 seconds
+   later (the AI model takes a moment to load).
+
+The console says "model not found":
+   The installer should have placed the AI model file automatically. If
+   for some reason it didn't, run the installer again — it's safe to do.
+
+The console says "ERROR" or shows a long Python traceback:
+   On the Manage Archive tab, click "Open Log Folder". This opens the
+   folder containing app.log. Share that file with whoever set up the
+   app for you — it has everything they need to diagnose the issue.
+
+A .doc file is "blocked by Word security":
+   Some older .doc files come from email and Windows blocks them. On the
+   Manage Archive tab, click "Unblock Sermon Library", then click
+   "Process New Files" again.

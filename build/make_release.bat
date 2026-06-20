@@ -102,16 +102,54 @@ if errorlevel 1 (
     echo.
 )
 
+:: ---------------------------------------------------------------------------
+:: Inno Setup installer build.
+::
+:: Wraps the dist\SermonNotes\ bundle + the LLM model into a single
+:: SermonNotes-Setup-<VERSION>.exe that the recipient double-clicks.
+:: See SermonNotes.iss for the layout and install behavior.
+::
+:: Skipped (with a clear message) if Inno Setup isn't installed — the
+:: PyInstaller bundle alone is still usable for a manual unzip-style ship.
+:: ---------------------------------------------------------------------------
+set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+if not exist "%ISCC%" set "ISCC=C:\Program Files\Inno Setup 6\ISCC.exe"
+
+if exist "%ISCC%" (
+    echo.
+    echo Building installer with Inno Setup. This takes ~3-5 minutes ^(LZMA2/max^)...
+    "%ISCC%" SermonNotes.iss
+    if errorlevel 1 (
+        echo.
+        echo WARNING: Inno Setup build failed. The PyInstaller bundle at
+        echo dist\SermonNotes\ is still usable; you can ship that folder
+        echo as a zip instead while the installer issue is sorted.
+        echo.
+    )
+) else (
+    echo.
+    echo NOTE: Inno Setup 6 not found at the standard install paths.
+    echo Skipping installer build. Install from https://jrsoftware.org/isdl.php
+    echo to enable single-exe installer output.
+    echo.
+)
+
 echo.
 echo === Build complete ===
-echo Output: dist\SermonNotes\
 echo.
-echo Next steps:
-echo   1. Zip dist\SermonNotes\ for distribution
-echo   2. The end user unzips, then runs SermonNotes.exe
-echo   3. On first launch the app will look for the LLM model at
-echo      %%LOCALAPPDATA%%\SermonNotes\models\Phi-3.5-mini-instruct-Q4_K_M.gguf
-echo      If missing, the app prints clear instructions to download it.
+echo PyInstaller bundle: dist\SermonNotes\
+if exist "dist\SermonNotes-Setup-1.0.0.exe" (
+    echo Installer:          dist\SermonNotes-Setup-1.0.0.exe
+    echo.
+    echo Ship the installer ^(single .exe^) for the simplest end-user experience:
+    echo   1. Recipient double-clicks SermonNotes-Setup-1.0.0.exe
+    echo   2. Clicks through the wizard ^(no admin rights needed^)
+    echo   3. App launches; they set their sermon folder; done.
+) else (
+    echo.
+    echo Installer was not produced. Ship the dist\SermonNotes\ folder as a zip
+    echo and follow the manual install steps in INSTALL.txt.
+)
 echo.
 pause
 endlocal

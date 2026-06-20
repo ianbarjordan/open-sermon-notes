@@ -9,3 +9,7 @@ pyinstaller==6.16.0
 # PyInstaller's pyi_rth_pkgres runtime hook crashes if backports.tarfile
 # isn't installed alongside setuptools. Belt-and-braces: pin it explicitly.
 backports.tarfile==1.2.0
+# make_release.bat runs `pytest -q` as a build pre-flight (refuses to ship
+# on a red suite). pytest isn't a runtime dep of the app, so it doesn't
+# belong in app/requirements_app.txt — it belongs here.
+pytest==8.4.2
